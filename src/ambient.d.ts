@@ -29,11 +29,20 @@ export {};
 
 // wasm-pack生成物の型が拾えない場合の保険（dev/buildで型エラーを避ける）
 declare module 'melody-dsp' {
-    export default function init(moduleOrPath?: unknown): Promise<void>;
+    export default function init(
+        arg?: unknown | { module_or_path?: unknown; module?: unknown }
+    ): Promise<void>;
 
     export class MelodyShifter {
         constructor(sample_rate: number);
         process_block(input: Float32Array, semitones: number): void;
+        readonly sample_rate: number;
+    }
+
+    export class MelodyEngine {
+        constructor(sample_rate: number);
+        set_notes(note_starts: Float32Array, note_ends: Float32Array, note_offsets: Float32Array): void;
+        process_buffer(input: Float32Array): void;
         readonly sample_rate: number;
     }
 }

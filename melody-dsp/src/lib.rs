@@ -125,3 +125,131 @@ fn read_delay_interp(buffer: &[f32], write_idx: usize, delay: f32) -> f32 {
     let b = buffer[i1];
     a + (b - a) * frac
 }
+
+#[derive(Clone, Copy, Debug)]
+struct NoteSpan {
+    start: f32,
+    end: f32,
+    offset: f32,
+}
+
+/// ノート配列（開始秒/終了秒/半音オフセット）に基づいてバッファを処理するエンジン。
+///
+/// ここでは「動く・わかりやすい」を優先し、
+/// - ノート探索は素朴（時刻→線形/前進）
+/// - オフセットが変わる区間ごとに `MelodyShifter` を呼ぶ
+/// とする。後でF0やノート編集に発展させやすい構造だけ先に作る。
+#[wasm_bindgen]
+pub struct MelodyEngine {
+    sample_rate: f32,
+    notes: Vec<NoteSpan>,
+    shifter: MelodyShifter,
+}
+
+#[wasm_bindgen]
+impl MelodyEngine {
+    #[wasm_bindgen(constructor)]
+    pub fn new(sample_rate: f32) -> MelodyEngine {
+        MelodyEngine {
+            sample_rate,
+            notes: Vec::new(),
+            shifter: MelodyShifter::new(sample_rate),
+        }
+    }
+
+    /// ノート情報をセットする。
+    /// - note_starts / note_ends: 秒
+    /// - note_offsets: 半音（+で高く、-で低く）
+    #[wasm_bindgen]
+    pub fn set_notes(&mut self, note_starts: Vec<f32>, note_ends: Vec<f32>, note_offsets: Vec<f32>) {
+        let n = note_starts
+            .len()
+            .min(note_ends.len())
+            .min(note_offsets.len());
+
+        self.notes.clear();
+        self.notes.reserve(n);
+
+        for i in 0..n {
+            let s = note_starts[i];
+            let e = note_ends[i];
+            let o = note_offsets[i];
+            if !s.is_finite() || !e.is_finite() || !o.is_finite() {
+                continue;
+            }
+            if e <= s {
+                continue;
+            }
+            self.notes.push(NoteSpan {
+                start: s.max(0.0),
+                end: e.max(0.0),
+                offset: o,
+            });
+        }
+
+        // まずは単純に start でソート（重なりや包含は未定義）
+        self.notes.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    /// input(モノラル)をノート配列に従って in-place で処理する。
+    ///
+    /// 「属するノートがあればそのoffsetでピッチシフト、なければバイパス」という仕様。
+    #[wasm_bindgen]
+    pub fn process_buffer(&mut self, input: &mut [f32]) {
+        if input.is_empty() {
+            return;
+        }
+        if self.notes.is_empty() {
+            return; // 全バイパス
+        }
+
+        let sr = self.sample_rate;
+        if !sr.is_finite() || sr <= 0.0 {
+            return;
+        }
+
+        // 区間ごとに処理：ノート境界で slice を切り替える
+        let mut sample_idx: usize = 0;
+        let mut note_idx: usize = 0;
+
+        while sample_idx < input.len() {
+            let t = (sample_idx as f32) / sr;
+
+            // t より前のノートを前進して捨てる
+            while note_idx < self.notes.len() && t >= self.notes[note_idx].end {
+                note_idx += 1;
+            }
+
+            // 現在時刻がノート内かどうか
+            let (offset, next_boundary_time) = if note_idx < self.notes.len() {
+                let note = self.notes[note_idx];
+                if t >= note.start && t < note.end {
+                    (note.offset, note.end)
+                } else {
+                    // 次のノート開始までバイパス
+                    (0.0, note.start)
+                }
+            } else {
+                // 以降はノートなし
+                (0.0, (input.len() as f32) / sr)
+            };
+
+            let mut end_sample = (next_boundary_time * sr).ceil() as isize;
+            if end_sample < 0 {
+                end_sample = 0;
+            }
+            let end_sample = (end_sample as usize).min(input.len());
+            let end_sample = end_sample.max(sample_idx + 1);
+
+            self.shifter
+                .process_block(&mut input[sample_idx..end_sample], offset);
+
+            sample_idx = end_sample;
+        }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+}

@@ -8,5 +8,12 @@ export default defineConfig({
 		sveltekit(),
 		masterCSS(),
 		vitePluginWasmPack('./melody-dsp'),
-	]
+	],
+	server: {
+		fs: {
+			allow: [
+				"./master.css.ts"
+			]
+		}
+	}
 });
