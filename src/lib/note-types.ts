@@ -1,3 +1,5 @@
+import { v4 as uuidv4 } from 'uuid';
+
 export interface NoteSegment {
 	id: string;
 	startTime: number; // seconds
@@ -15,7 +17,7 @@ export interface NoteTrack {
 
 export function createNoteSegment(init: Omit<NoteSegment, 'id'> & { id?: string }): NoteSegment {
 	return {
-		id: init.id ?? crypto.randomUUID(),
+		id: init.id ?? uuidv4(),
 		startTime: init.startTime,
 		endTime: init.endTime,
 		baseSemitone: init.baseSemitone,

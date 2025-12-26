@@ -23,7 +23,7 @@
     let renderedBuffer: AudioBuffer | null = null;
 
     let noteTrack: NoteTrack | null = null;
-    let selectedNoteId: string | null = null;
+    let selectedNoteIds: string[] = [];
 
     async function ensureAudioGraph() {
         if (!browser) return;
@@ -78,10 +78,11 @@
     function selectNoteByTime(timeSec: number) {
         if (!noteTrack) return;
         const hit = noteTrack.notes.find((n) => timeSec >= n.startTime && timeSec < n.endTime);
-        selectedNoteId = hit?.id ?? null;
+        selectedNoteIds = hit?.id ? [hit.id] : [];
     }
 
     function updateSelectedPitchOffset(v: number) {
+        const selectedNoteId = selectedNoteIds[0];
         if (!noteTrack || !selectedNoteId) return;
         noteTrack = {
             ...noteTrack,
@@ -90,6 +91,7 @@
     }
 
     function updateSelectedEnabled(checked: boolean) {
+        const selectedNoteId = selectedNoteIds[0];
         if (!noteTrack || !selectedNoteId) return;
         noteTrack = {
             ...noteTrack,
@@ -178,7 +180,7 @@
         loadedBuffer = downmixToMono(decoded);
         renderedBuffer = null;
         noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
-        selectedNoteId = null;
+        selectedNoteIds = [];
     }
 
     async function play() {
@@ -244,7 +246,7 @@
             renderedBuffer = null;
             noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
             loadedName = 'text.wav';
-            selectedNoteId = null;
+            selectedNoteIds = [];
         } catch (e) {
             console.error('Default audio load failed', e);
         }
@@ -295,7 +297,7 @@
                 if (!loadedBuffer) return;
                 if (!noteTrack) noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
                 noteTrack = { ...noteTrack, notes: makePresetNotes(noteTrack.duration) };
-                selectedNoteId = noteTrack.notes[0]?.id ?? null;
+                selectedNoteIds = noteTrack.notes[0]?.id ? [noteTrack.notes[0].id] : [];
             }}
             disabled={!loadedBuffer}
         >
@@ -311,8 +313,8 @@
     {#if noteTrack}
         <NoteEditor
             track={noteTrack}
-            selectedNoteId={selectedNoteId}
-            onSelect={(id) => (selectedNoteId = id)}
+            selectedNoteIds={selectedNoteIds}
+            onSelect={(ids) => (selectedNoteIds = ids)}
             onChange={(t) => (noteTrack = t)}
         />
     {/if}
