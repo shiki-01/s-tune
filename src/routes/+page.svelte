@@ -1,9 +1,10 @@
 <script lang="ts">
     import { browser } from '$app/environment';
-    import { onDestroy } from 'svelte';
+    import { onDestroy, onMount } from 'svelte';
     import init, { MelodyEngine } from 'melody-dsp';
-    import { createNoteSegment, type NoteSegment, type NoteTrack } from '$lib/note-types';
-    import { encodeWavMono16 } from '$lib/audio/wav';
+    import { createNoteSegment, type NoteSegment, type NoteTrack } from '$lib/note-model';
+    import NoteEditor from '$lib/components/NoteEditor.svelte';
+    import test from '$lib/assets/test.wav?url'; //TODO: dev only
 
     // AudioWorkletは "実ファイルのURL" を addModule() へ渡す必要がある。
     // `?url` を使うと「URL文字列をexportするだけのViteモジュール」になり、
@@ -20,7 +21,6 @@
     let loadedName = '';
     let loadedBuffer: AudioBuffer | null = null;
     let renderedBuffer: AudioBuffer | null = null;
-    let renderedWavUrl: string | null = null;
 
     let noteTrack: NoteTrack | null = null;
     let selectedNoteId: string | null = null;
@@ -122,14 +122,6 @@
 
         renderedBuffer = new AudioBuffer({ length: buf.length, numberOfChannels: 1, sampleRate: loadedBuffer.sampleRate });
         renderedBuffer.copyToChannel(buf, 0);
-
-        // WAVダウンロード用
-        if (renderedWavUrl) {
-            URL.revokeObjectURL(renderedWavUrl);
-            renderedWavUrl = null;
-        }
-        const wav = encodeWavMono16(buf, loadedBuffer.sampleRate);
-        renderedWavUrl = URL.createObjectURL(wav);
     }
 
     async function playRendered() {
@@ -185,13 +177,8 @@
         const decoded = await ctx.decodeAudioData(ab.slice(0));
         loadedBuffer = downmixToMono(decoded);
         renderedBuffer = null;
-        if (renderedWavUrl) {
-            URL.revokeObjectURL(renderedWavUrl);
-            renderedWavUrl = null;
-        }
         noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
-        noteTrack = { ...noteTrack, notes: makePresetNotes(noteTrack.duration) };
-        selectedNoteId = noteTrack.notes[0]?.id ?? null;
+        selectedNoteId = null;
     }
 
     async function play() {
@@ -236,24 +223,43 @@
         workletNode = null;
         void ctx?.close();
         ctx = null;
-        if (renderedWavUrl) {
-            URL.revokeObjectURL(renderedWavUrl);
-            renderedWavUrl = null;
+    });
+
+    onMount(async () => {
+        if (!browser) return;
+        // dev だけ自動読み込みにしたいならこの if を付ける
+        if (!import.meta.env.DEV) return;
+
+        // すでに手動で読み込んでいる場合は何もしない
+        if (loadedBuffer) return;
+
+        await ensureAudioGraph();
+        if (!ctx) return;
+
+        try {
+            const res = await fetch(test);
+            const ab = await res.arrayBuffer();
+            const decoded = await ctx.decodeAudioData(ab.slice(0));
+            loadedBuffer = downmixToMono(decoded);
+            renderedBuffer = null;
+            noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
+            loadedName = 'text.wav';
+            selectedNoteId = null;
+        } catch (e) {
+            console.error('Default audio load failed', e);
         }
     });
 </script>
 
-<h1>s-tune (Melodyneライト 土台)</h1>
-
-<section style="display: grid; gap: 12px; max-width: 720px;">
-    <label>
-        音声ファイルを読み込む（wav推奨 / モノラル化して再生）
-        <input type="file" accept="audio/*" on:change={onPickFile} />
+<section class="flex flex:column gap:20px w:100% h:100dvh p:20px">
+    <label class="flex flex:row gap:10px ai:center jc:start">
+        <span>音声ファイルを読み込む</span>
+        <input type="file" accept="audio/*" onchange={onPickFile} />
     </label>
 
     <div>Loaded: {loadedName || '(none)'}</div>
 
-    <label>
+    <label class="flex flex:row gap:10px">
         ピッチシフト（半音）: {semitones.toFixed(1)}
         <input
             type="range"
@@ -261,19 +267,31 @@
             max="12"
             step="0.1"
             value={semitones}
-            on:input={(e) => onSemitonesInput(Number((e.currentTarget as HTMLInputElement).value))}
+            oninput={(e) => onSemitonesInput(Number((e.currentTarget as HTMLInputElement).value))}
         />
     </label>
 
-    <div style="display: flex; gap: 8px;">
-        <button on:click={play} disabled={!loadedBuffer}>再生（Workletプレビュー）</button>
-        <button on:click={playRendered} disabled={!renderedBuffer}>再生（レンダ結果）</button>
-        <button on:click={stop}>停止</button>
+    <div class="flex flex:row gap:20px">
+        <button
+            class="p:6px|8px bg:#333 fg:white r:6px flex ai:center jc:center"
+            onclick={play}
+            disabled={!loadedBuffer}
+        >再生 / Worklet</button>
+        <button
+            class="p:6px|8px bg:#333 fg:white r:6px flex ai:center jc:center"
+            onclick={playRendered}
+            disabled={!renderedBuffer}
+        >再生 / Render</button>
+        <button
+            class="p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center"
+            onclick={stop}
+        >停止</button>
     </div>
 
-    <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+    <div class="flex flex:row gap:20px">
         <button
-            on:click={() => {
+            class="p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center"
+            onclick={() => {
                 if (!loadedBuffer) return;
                 if (!noteTrack) noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
                 noteTrack = { ...noteTrack, notes: makePresetNotes(noteTrack.duration) };
@@ -283,88 +301,19 @@
         >
             ノートプリセット適用
         </button>
-        <button on:click={renderWithNotes} disabled={!loadedBuffer || !noteTrack}>ノートでレンダリング</button>
-        {#if renderedWavUrl}
-            <a href={renderedWavUrl} download="rendered.wav">WAVをダウンロード</a>
-        {/if}
+        <button
+            class="p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center"
+            onclick={renderWithNotes}
+            disabled={!loadedBuffer || !noteTrack}
+        >Render & Play用にレンダ</button>
     </div>
 
     {#if noteTrack}
-        <h2 style="margin: 12px 0 4px; font-size: 1.05em;">ノート（簡易エディタ）</h2>
-        <div style="display: grid; gap: 8px;">
-            <div style="opacity: 0.8; font-size: 0.95em;">
-                クリックで選択 → pitchOffset を編集 →「ノートでレンダリング」
-            </div>
-            <svg
-                width="720"
-                height="160"
-                viewBox="0 0 720 160"
-                style="border: 1px solid rgba(0,0,0,0.2); background: rgba(0,0,0,0.02);"
-                role="button"
-                tabindex="0"
-                aria-label="ノートを選択"
-                on:click={(e) => {
-                    const track = noteTrack;
-                    if (!track) return;
-                    const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
-                    const x = e.clientX - rect.left;
-                    const t = (x / rect.width) * track.duration;
-                    selectNoteByTime(t);
-                }}
-                on:keydown={(e) => {
-                    if (e.key !== 'Enter' && e.key !== ' ') return;
-                    e.preventDefault();
-                    const track = noteTrack;
-                    if (!track) return;
-                    // キーボード操作時は現在選択を維持（必要なら後でカーソル導入）
-                    if (!selectedNoteId) selectNoteByTime(0);
-                }}
-            >
-                {#each noteTrack.notes as n (n.id)}
-                    {@const x = (n.startTime / noteTrack.duration) * 720}
-                    {@const w = ((n.endTime - n.startTime) / noteTrack.duration) * 720}
-                    {@const y = 20 + (120 - (n.baseSemitone - 48) * 4)}
-                    <rect
-                        x={x}
-                        y={Math.max(10, Math.min(130, y))}
-                        width={Math.max(2, w)}
-                        height="18"
-                        opacity={n.enabled ? 1 : 0.3}
-                        fill={n.id === selectedNoteId ? 'rgba(0, 120, 255, 0.55)' : 'rgba(0,0,0,0.25)'}
-                        stroke="rgba(0,0,0,0.35)"
-                    />
-                {/each}
-            </svg>
-
-            {#if selectedNoteId}
-                {@const note = noteTrack.notes.find((n) => n.id === selectedNoteId)}
-                {#if note}
-                    <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
-                        <div>Selected: {note.startTime.toFixed(2)}s–{note.endTime.toFixed(2)}s</div>
-                        <label>
-                            pitchOffset(semitones):
-                            <input
-                                type="number"
-                                step="0.1"
-                                value={note.pitchOffset}
-                                on:input={(e) => updateSelectedPitchOffset(Number((e.currentTarget as HTMLInputElement).value))}
-                            />
-                        </label>
-                        <label>
-                            enabled:
-                            <input
-                                type="checkbox"
-                                checked={note.enabled}
-                                on:change={(e) => updateSelectedEnabled((e.currentTarget as HTMLInputElement).checked)}
-                            />
-                        </label>
-                    </div>
-                {/if}
-            {/if}
-        </div>
+        <NoteEditor
+            track={noteTrack}
+            selectedNoteId={selectedNoteId}
+            onSelect={(id) => (selectedNoteId = id)}
+            onChange={(t) => (noteTrack = t)}
+        />
     {/if}
-
-    <p style="opacity: 0.8; font-size: 0.95em;">
-        経路: AudioBufferSourceNode → AudioWorkletNode(melody-processor) → WASM(MelodyShifter.process_block) → destination
-    </p>
 </section>
