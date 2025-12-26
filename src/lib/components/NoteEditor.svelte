@@ -22,15 +22,18 @@
 
 	let { track, selectedNoteIds, onChange, onSelect }: Props = $props();
 
-	const MIN_SEMITONE = 48;
-	const MAX_SEMITONE = 72;
+	const MIN_SEMITONE = 36; // C2
+	const MAX_SEMITONE = 84; // C6
+	const ROW_H_PX = 18;
 	const GUTTER_PX = 42;
 	const EDGE_PX = 6;
 	const MIN_NOTE_SEC = 0.02;
 	const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as const;
+	const SVG_H = (MAX_SEMITONE - MIN_SEMITONE + 1) * ROW_H_PX;
 
 	let editor: HTMLDivElement | null = $state(null);
 	let svgEl: SVGSVGElement | null = $state(null);
+	let svgW = $state(720);
 
 	let editorState = $state(createEditorState({ tool: 'select', selectedNoteIds: [] }));
 	let bpm = $state(120);
@@ -40,16 +43,17 @@
 		editorState.selectedNoteIds = selectedNoteIds;
 	});
 
-	let W = $derived(() => {
-		if (!editor) return 720;
-		return editor.clientWidth;
+	$effect(() => {
+		if (!editor) return;
+		const ro = new ResizeObserver(() => {
+			svgW = editor?.clientWidth ?? 720;
+		});
+		ro.observe(editor);
+		svgW = editor.clientWidth;
+		return () => ro.disconnect();
 	});
-	let H = $derived(() => {
-		if (!editor) return 240;
-		return editor.clientHeight;
-	});
-	let areaW = $derived(() => getAreaWidth(W()));
-	let rowH = $derived(() => getRowH());
+
+	let areaW = $derived(() => getAreaWidth(svgW));
 	let beatSec = $derived(() => (Number.isFinite(bpm) && bpm > 0 ? 60 / bpm : 0));
 
 	function setTool(tool: EditorTool) {
@@ -59,10 +63,6 @@
 	function setSelected(ids: string[]) {
 		editorState.selectedNoteIds = ids;
 		onSelect(ids);
-	}
-
-	function getRowH(): number {
-		return H() / (MAX_SEMITONE - MIN_SEMITONE + 1);
 	}
 
 	function getNoteName(semitone: number): string {
@@ -75,15 +75,13 @@
 	}
 
 	function noteRect(n: NoteSegment) {
-		const areaW = getAreaWidth(W());
-		const x0 = timeToX(n.startTime, areaW, track.duration);
-		const x1 = timeToX(n.endTime, areaW, track.duration);
+		const x0 = timeToX(n.startTime, areaW(), track.duration);
+		const x1 = timeToX(n.endTime, areaW(), track.duration);
 		const x = GUTTER_PX + x0;
 		const w = x1 - x0;
-		const rowH = getRowH();
-		const h = Math.max(8, rowH * 0.85);
-		const yTop = semitoneToYTop(n.baseSemitone, H(), MIN_SEMITONE, MAX_SEMITONE);
-		const y = yTop + (rowH - h) / 2;
+		const h = Math.max(8, ROW_H_PX * 0.85);
+		const yTop = semitoneToYTop(n.baseSemitone, SVG_H, MIN_SEMITONE, MAX_SEMITONE);
+		const y = yTop + (ROW_H_PX - h) / 2;
 		return { x, y, w: Math.max(2, w), h };
 	}
 
@@ -386,14 +384,18 @@
 		</label>
 	</div>
 
-	<div bind:this={editor} class="w:100% h:320px b:2px|solid|#222 r:6px">
+	<div
+		bind:this={editor}
+		class="w:100% h:600px b:2px|solid|#222 r:6px"
+		style="overflow-y:auto; overflow-x:hidden;"
+	>
 		<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 		<svg
 			bind:this={svgEl}
 			class="outline:none:focus"
-			width={W()}
-			height={H()}
-			viewBox={`0 0 ${W()} ${H()}`}
+			width={svgW}
+			height={SVG_H}
+			viewBox={`0 0 ${svgW} ${SVG_H}`}
 			role="application"
 			aria-label="ノートエディタ"
 			onpointerdown={onPointerDown}
@@ -406,18 +408,18 @@
 				{#each Array(Math.floor(track.duration / beatSec()) + 1) as _, i (i)}
 					{@const t = i * beatSec()}
 					{@const x = GUTTER_PX + timeToX(t, areaW(), track.duration)}
-					<line x1={x} y1={0} x2={x} y2={H()} stroke="rgba(0,0,0,0.10)" />
+					<line x1={x} y1={0} x2={x} y2={SVG_H} stroke="rgba(0,0,0,0.10)" />
 				{/each}
 			{/if}
 
 			<!-- grid: horizontal semitone lines + left labels -->
 			{#each Array(MAX_SEMITONE - MIN_SEMITONE + 1) as _, i (i)}
 				{@const semi = MAX_SEMITONE - i}
-				{@const y = i * rowH()}
-				<line x1={0} y1={y} x2={W()} y2={y} stroke="rgba(0,0,0,0.10)" />
+				{@const y = i * ROW_H_PX}
+				<line x1={0} y1={y} x2={svgW} y2={y} stroke="rgba(0,0,0,0.10)" />
 				<text
 					x={6}
-					y={y + rowH() * 0.75}
+					y={y + ROW_H_PX * 0.75}
 					font-size="12"
 					fill="rgba(0,0,0,0.65)"
 					style="user-select:none"
@@ -427,7 +429,7 @@
 			{/each}
 
 			<!-- gutter separator -->
-			<line x1={GUTTER_PX} y1={0} x2={GUTTER_PX} y2={H()} stroke="rgba(0,0,0,0.25)" />
+			<line x1={GUTTER_PX} y1={0} x2={GUTTER_PX} y2={SVG_H} stroke="rgba(0,0,0,0.25)" />
 
 			{#each track.notes as n (n.id)}
 				{@const r = noteRect(n)}
@@ -449,9 +451,9 @@
 			{#if drag && drag.mode === 'pen'}
 				{@const x0 = GUTTER_PX + timeToX(drag.previewStart, areaW(), track.duration)}
 				{@const x1 = GUTTER_PX + timeToX(drag.previewEnd, areaW(), track.duration)}
-				{@const h = Math.max(8, rowH() * 0.85)}
-				{@const yTop = semitoneToYTop(drag.baseSemitone, H(), MIN_SEMITONE, MAX_SEMITONE)}
-				{@const y0 = yTop + (rowH() - h) / 2}
+				{@const h = Math.max(8, ROW_H_PX * 0.85)}
+				{@const yTop = semitoneToYTop(drag.baseSemitone, SVG_H, MIN_SEMITONE, MAX_SEMITONE)}
+				{@const y0 = yTop + (ROW_H_PX - h) / 2}
 				<rect
 					x={Math.min(x0, x1)}
 					y={y0}
