@@ -5,6 +5,8 @@ export interface NoteSegment {
 	startTime: number; // seconds
 	endTime: number; // seconds
 	baseSemitone: number; // e.g. MIDI note number (placeholder for later F0)
+	// recommendation / snap (optional)
+	snappedSemitone?: number; // recommended pitch (MIDI) in selected key/scale
 	pitchOffset: number; // semitones
 	enabled: boolean;
 
@@ -32,6 +34,7 @@ export type NoteSegmentInit = {
 	startTime: number;
 	endTime: number;
 	baseSemitone: number;
+	snappedSemitone?: number;
 	pitchOffset?: number;
 	enabled?: boolean;
 	pitchCenterOffset?: number;
@@ -48,6 +51,7 @@ export function createNoteSegment(init: NoteSegmentInit): NoteSegment {
 		startTime: init.startTime,
 		endTime: init.endTime,
 		baseSemitone: init.baseSemitone,
+		snappedSemitone: init.snappedSemitone ?? init.baseSemitone,
 		pitchOffset: init.pitchOffset ?? 0,
 		enabled: init.enabled ?? true,
 		pitchCenterOffset: init.pitchCenterOffset ?? 0,

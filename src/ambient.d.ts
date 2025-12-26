@@ -41,16 +41,20 @@ declare module 'melody-dsp' {
 
     export class MelodyEngine {
         constructor(sample_rate: number);
+        set_harmonic_gains(gains: Float32Array): void;
         set_notes(
             note_starts: Float32Array,
             note_ends: Float32Array,
+            base_semitones: Float32Array,
             note_offsets: Float32Array,
             pitch_center_offsets: Float32Array,
             pitch_mod_amounts: Float32Array,
             pitch_drift_amounts: Float32Array,
             time_stretch_starts: Float32Array,
             time_stretch_ends: Float32Array,
-            formant_shifts: Float32Array
+            formant_shifts: Float32Array,
+            harmonics_per_note: number,
+            note_harmonics_flat: Float32Array
         ): void;
         process_buffer(input: Float32Array): void;
         readonly sample_rate: number;
