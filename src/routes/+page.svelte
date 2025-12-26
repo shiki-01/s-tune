@@ -12,18 +12,18 @@
     const workletModuleUrl = new URL('../lib/audio/worklet-processor.ts', import.meta.url);
     import wasmUrl from 'melody-dsp/melody_dsp_bg.wasm?url';
 
-    let semitones = 0;
+    let semitones = $state(0);
 
-    let ctx: AudioContext | null = null;
-    let workletNode: AudioWorkletNode | null = null;
-    let sourceNode: AudioBufferSourceNode | null = null;
+    let ctx: AudioContext | null = $state(null);
+    let workletNode: AudioWorkletNode | null = $state(null);
+    let sourceNode: AudioBufferSourceNode | null = $state(null);
 
-    let loadedName = '';
-    let loadedBuffer: AudioBuffer | null = null;
-    let renderedBuffer: AudioBuffer | null = null;
+    let loadedName = $state('');
+    let loadedBuffer: AudioBuffer | null = $state(null);
+    let renderedBuffer: AudioBuffer | null = $state(null);
 
-    let noteTrack: NoteTrack | null = null;
-    let selectedNoteIds: string[] = [];
+    let noteTrack: NoteTrack | null = $state(null);
+    let selectedNoteIds: string[] = $state([]);
 
     async function ensureAudioGraph() {
         if (!browser) return;
@@ -116,7 +116,23 @@
         const starts = new Float32Array(enabledNotes.map((n) => n.startTime));
         const ends = new Float32Array(enabledNotes.map((n) => n.endTime));
         const offsets = new Float32Array(enabledNotes.map((n) => n.pitchOffset));
-        engine.set_notes(starts, ends, offsets);
+        const centerOffsets = new Float32Array(enabledNotes.map((n) => n.pitchCenterOffset));
+        const modAmounts = new Float32Array(enabledNotes.map((n) => n.pitchModAmount));
+        const driftAmounts = new Float32Array(enabledNotes.map((n) => n.pitchDriftAmount));
+        const timeStretchStarts = new Float32Array(enabledNotes.map((n) => n.timeStretchStart));
+        const timeStretchEnds = new Float32Array(enabledNotes.map((n) => n.timeStretchEnd));
+        const formantShifts = new Float32Array(enabledNotes.map((n) => n.formantShift));
+        engine.set_notes(
+            starts,
+            ends,
+            offsets,
+            centerOffsets,
+            modAmounts,
+            driftAmounts,
+            timeStretchStarts,
+            timeStretchEnds,
+            formantShifts
+        );
 
         const input = loadedBuffer.getChannelData(0);
         const buf = new Float32Array(input); // 元を破壊しない

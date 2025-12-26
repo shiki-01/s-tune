@@ -1,4 +1,12 @@
-export type EditorTool = 'select' | 'pen' | 'erase';
+export type EditorTool =
+	| 'select'
+	| 'pen'
+	| 'erase'
+	| 'pitch-center-tool'
+	| 'pitch-mod-tool'
+	| 'pitch-drift-tool'
+	| 'time-tool'
+	| 'formant-tool';
 
 export interface EditorState {
 	tool: EditorTool;

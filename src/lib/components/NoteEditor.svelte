@@ -10,6 +10,7 @@
 		timeToX,
 		xToTime,
 		yToSemitone,
+		yToSemitoneFloat,
 		semitoneToYTop
 	} from '$lib/editor/coords';
 
@@ -38,6 +39,7 @@
 	let editorState = $state(createEditorState({ tool: 'select', selectedNoteIds: [] }));
 	let bpm = $state(120);
 	let snapEnabled = $state(true);
+	let pitchSnapEnabled = $state(true);
 
 	$effect(() => {
 		editorState.selectedNoteIds = selectedNoteIds;
@@ -72,6 +74,59 @@
 
 	function getAreaWidth(totalWidth: number): number {
 		return Math.max(1, totalWidth - GUTTER_PX);
+	}
+
+	function getPitchValueFromY(y: number): number {
+		return pitchSnapEnabled
+			? yToSemitone(y, SVG_H, MIN_SEMITONE, MAX_SEMITONE)
+			: yToSemitoneFloat(y, SVG_H, MIN_SEMITONE, MAX_SEMITONE);
+	}
+
+	function clampAmount01to2(v: number): number {
+		if (!Number.isFinite(v)) return 1;
+		return Math.max(0, Math.min(2, v));
+	}
+
+	function pitchCurveSemitoneDelta(n: NoteSegment, tSec: number): number {
+		const t0 = n.startTime;
+		const t1 = n.endTime;
+		const dur = Math.max(1e-6, t1 - t0);
+		const u = (tSec - t0) / dur;
+		const center = n.pitchOffset + n.pitchCenterOffset;
+		const modHz = 5.5;
+		const modAmp = 0.25 * n.pitchModAmount;
+		const driftAmp = 0.2 * n.pitchDriftAmount;
+		const mod = Math.sin(2 * Math.PI * modHz * (tSec - t0)) * modAmp;
+		const drift = (u - 0.5) * 2.0 * driftAmp;
+		return center + mod + drift;
+	}
+
+	function notePitchCurvePoints(n: NoteSegment, samples = 24): string {
+		const x0 = GUTTER_PX + timeToX(n.startTime, areaW(), track.duration);
+		const x1 = GUTTER_PX + timeToX(n.endTime, areaW(), track.duration);
+		const dur = Math.max(1e-6, n.endTime - n.startTime);
+
+		const pts: string[] = [];
+		const count = Math.max(2, Math.floor(samples));
+		for (let i = 0; i < count; i++) {
+			const u = i / (count - 1);
+			const tSec = n.startTime + dur * u;
+			const absSemi = n.baseSemitone + pitchCurveSemitoneDelta(n, tSec);
+			const yTop = semitoneToYTop(absSemi, SVG_H, MIN_SEMITONE, MAX_SEMITONE);
+			const y = yTop + ROW_H_PX / 2;
+			const x = x0 + (x1 - x0) * u;
+			pts.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+		}
+		return pts.join(' ');
+	}
+
+	function formatSigned(v: number): string {
+		if (!Number.isFinite(v) || Math.abs(v) < 1e-3) return '0';
+		const sign = v > 0 ? '+' : '';
+		const abs = Math.abs(v);
+		// 半音単位編集が多いので 1桁小数まで
+		const s = abs >= 10 ? abs.toFixed(0) : abs.toFixed(1).replace(/\.0$/, '');
+		return `${sign}${s}`;
 	}
 
 	function noteRect(n: NoteSegment) {
@@ -136,6 +191,27 @@
 			anchorTime: number;
 			activeId: string;
 			snapshot: { startTime: number; endTime: number; baseSemitone: number };
+		}
+		| {
+			mode:
+				| 'pitch-center'
+				| 'pitch-mod'
+				| 'pitch-drift'
+				| 'formant'
+				| 'time-stretch-start'
+				| 'time-stretch-end';
+			pointerId: number;
+			activeId: string;
+			anchorX: number;
+			anchorY: number;
+			snapshot: {
+				pitchCenterOffset: number;
+				pitchModAmount: number;
+				pitchDriftAmount: number;
+				formantShift: number;
+				timeStretchStart: number;
+				timeStretchEnd: number;
+			};
 		};
 
 	let drag = $state<DragState | null>(null);
@@ -154,6 +230,26 @@
 				e.preventDefault();
 				setTool('erase');
 			}
+			if (e.key === '4') {
+				e.preventDefault();
+				setTool('pitch-center-tool');
+			}
+			if (e.key === '5') {
+				e.preventDefault();
+				setTool('pitch-mod-tool');
+			}
+			if (e.key === '6') {
+				e.preventDefault();
+				setTool('pitch-drift-tool');
+			}
+			if (e.key === '7') {
+				e.preventDefault();
+				setTool('time-tool');
+			}
+			if (e.key === '8') {
+				e.preventDefault();
+				setTool('formant-tool');
+			}
 		};
 		window.addEventListener('keydown', onKeyDown);
 		onDestroy(() => window.removeEventListener('keydown', onKeyDown));
@@ -167,7 +263,7 @@
 		const areaW = getAreaWidth(width);
 		const localX = x - GUTTER_PX;
 		const t = snapTime(xToTime(localX, areaW, track.duration), bpm, snapEnabled);
-		const semi = yToSemitone(y, height, MIN_SEMITONE, MAX_SEMITONE);
+		const semi = getPitchValueFromY(y);
 		const hit = hitTest(x, y);
 		const multi = e.ctrlKey || e.metaKey;
 
@@ -189,6 +285,54 @@
 
 		if (editorState.tool === 'erase') {
 			if (hit) removeNote(hit.note.id);
+			e.preventDefault();
+			return;
+		}
+
+		if (
+			editorState.tool === 'pitch-center-tool' ||
+			editorState.tool === 'pitch-mod-tool' ||
+			editorState.tool === 'pitch-drift-tool' ||
+			editorState.tool === 'formant-tool' ||
+			editorState.tool === 'time-tool'
+		) {
+			if (!hit) {
+				if (!multi) setSelected([]);
+				return;
+			}
+
+			const active = hit.note;
+			setSelected([active.id]);
+
+			const baseDrag = {
+				pointerId: e.pointerId,
+				activeId: active.id,
+				anchorX: x,
+				anchorY: y,
+				snapshot: {
+					pitchCenterOffset: active.pitchCenterOffset,
+					pitchModAmount: active.pitchModAmount,
+					pitchDriftAmount: active.pitchDriftAmount,
+					formantShift: active.formantShift,
+					timeStretchStart: active.timeStretchStart,
+					timeStretchEnd: active.timeStretchEnd
+				}
+			};
+
+			if (editorState.tool === 'pitch-center-tool') drag = { mode: 'pitch-center', ...baseDrag };
+			if (editorState.tool === 'pitch-mod-tool') drag = { mode: 'pitch-mod', ...baseDrag };
+			if (editorState.tool === 'pitch-drift-tool') drag = { mode: 'pitch-drift', ...baseDrag };
+			if (editorState.tool === 'formant-tool') drag = { mode: 'formant', ...baseDrag };
+			if (editorState.tool === 'time-tool') {
+				const r = noteRect(active);
+				const chooseEnd = hit.part === 'body' ? x >= r.x + r.w / 2 : hit.part === 'right';
+				drag = {
+					mode: chooseEnd ? 'time-stretch-end' : 'time-stretch-start',
+					...baseDrag
+				};
+			}
+
+			svgEl.setPointerCapture(e.pointerId);
 			e.preventDefault();
 			return;
 		}
@@ -257,7 +401,7 @@
 		const localX = x - GUTTER_PX;
 		const tRaw = xToTime(localX, areaW, track.duration);
 		const t = snapTime(tRaw, bpm, snapEnabled);
-		const semi = yToSemitone(y, height, MIN_SEMITONE, MAX_SEMITONE);
+		const semi = getPitchValueFromY(y);
 
 		if (currentDrag.mode === 'pen') {
 			currentDrag.previewStart = Math.min(currentDrag.startTime, t);
@@ -278,25 +422,79 @@
 				const newStart = clamp(base.startTime + dt, 0, Math.max(0, track.duration - dur));
 				const newEnd = newStart + dur;
 				const newBase = clamp(base.baseSemitone + dSemi, MIN_SEMITONE, MAX_SEMITONE);
-				const newOffset = dSemi !== 0 ? n.pitchOffset + dSemi : n.pitchOffset;
-				return { ...n, startTime: newStart, endTime: newEnd, baseSemitone: newBase, pitchOffset: newOffset };
+				return { ...n, startTime: newStart, endTime: newEnd, baseSemitone: newBase };
 			});
 			return;
 		}
 
-		// resize
-		const base = currentDrag.snapshot;
-		const anchor = snapTime(currentDrag.anchorTime, bpm, snapEnabled);
-		const dt = t - anchor;
+		if (
+			currentDrag.mode === 'pitch-center' ||
+			currentDrag.mode === 'formant' ||
+			currentDrag.mode === 'pitch-mod' ||
+			currentDrag.mode === 'pitch-drift'
+		) {
+			const dy = currentDrag.anchorY - y;
+			const dSemi = pitchSnapEnabled ? Math.round(dy / ROW_H_PX) : dy / ROW_H_PX;
 
-		if (currentDrag.mode === 'resize-left') {
-			const newStart = clamp(base.startTime + dt, 0, base.endTime - MIN_NOTE_SEC);
-			updateNotes((n) => (n.id === currentDrag.activeId ? { ...n, startTime: newStart } : n));
+			if (currentDrag.mode === 'pitch-center') {
+				updateNotes((n) =>
+					n.id === currentDrag.activeId
+						? { ...n, pitchCenterOffset: currentDrag.snapshot.pitchCenterOffset + dSemi }
+						: n
+				);
+				return;
+			}
+
+			if (currentDrag.mode === 'formant') {
+				updateNotes((n) =>
+					n.id === currentDrag.activeId
+						? { ...n, formantShift: currentDrag.snapshot.formantShift + dSemi }
+						: n
+				);
+				return;
+			}
+
+			const dAmt = (currentDrag.anchorY - y) / 120;
+			if (currentDrag.mode === 'pitch-mod') {
+				const next = clampAmount01to2(currentDrag.snapshot.pitchModAmount + dAmt);
+				updateNotes((n) => (n.id === currentDrag.activeId ? { ...n, pitchModAmount: next } : n));
+				return;
+			}
+
+			const next = clampAmount01to2(currentDrag.snapshot.pitchDriftAmount + dAmt);
+			updateNotes((n) => (n.id === currentDrag.activeId ? { ...n, pitchDriftAmount: next } : n));
 			return;
 		}
 
-		const newEnd = clamp(base.endTime + dt, base.startTime + MIN_NOTE_SEC, track.duration);
-		updateNotes((n) => (n.id === currentDrag.activeId ? { ...n, endTime: newEnd } : n));
+		if (currentDrag.mode === 'time-stretch-start' || currentDrag.mode === 'time-stretch-end') {
+			const dx = x - currentDrag.anchorX;
+			const scaleDelta = dx / 200;
+			const clampStretch = (v: number) => Math.max(0.5, Math.min(2.0, v));
+			if (currentDrag.mode === 'time-stretch-start') {
+				const next = clampStretch(currentDrag.snapshot.timeStretchStart * (1 + scaleDelta));
+				updateNotes((n) => (n.id === currentDrag.activeId ? { ...n, timeStretchStart: next } : n));
+				return;
+			}
+			const next = clampStretch(currentDrag.snapshot.timeStretchEnd * (1 + scaleDelta));
+			updateNotes((n) => (n.id === currentDrag.activeId ? { ...n, timeStretchEnd: next } : n));
+			return;
+		}
+
+		if (currentDrag.mode === 'resize-left' || currentDrag.mode === 'resize-right') {
+			const base = currentDrag.snapshot;
+			const anchor = snapTime(currentDrag.anchorTime, bpm, snapEnabled);
+			const dt = t - anchor;
+
+			if (currentDrag.mode === 'resize-left') {
+				const newStart = clamp(base.startTime + dt, 0, base.endTime - MIN_NOTE_SEC);
+				updateNotes((n) => (n.id === currentDrag.activeId ? { ...n, startTime: newStart } : n));
+				return;
+			}
+
+			const newEnd = clamp(base.endTime + dt, base.startTime + MIN_NOTE_SEC, track.duration);
+			updateNotes((n) => (n.id === currentDrag.activeId ? { ...n, endTime: newEnd } : n));
+			return;
+		}
 	}
 
 	function onPointerUp(e: PointerEvent) {
@@ -373,6 +571,10 @@
 			snap
 		</label>
 		<label class="flex flex:row gap:8px ai:center">
+			<input type="checkbox" bind:checked={pitchSnapEnabled} />
+			pitch snap
+		</label>
+		<label class="flex flex:row gap:8px ai:center">
 			BPM
 			<input
 				class="w:90px p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center"
@@ -382,6 +584,62 @@
 				bind:value={bpm}
 			/>
 		</label>
+
+		<button
+			type="button"
+			class={
+				editorState.tool === 'pitch-center-tool'
+					? 'p:6px|8px bg:#333 fg:white r:6px flex ai:center jc:center'
+					: 'p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center'
+			}
+			onclick={() => setTool('pitch-center-tool')}
+		>
+			Center (4)
+		</button>
+		<button
+			type="button"
+			class={
+				editorState.tool === 'pitch-mod-tool'
+					? 'p:6px|8px bg:#333 fg:white r:6px flex ai:center jc:center'
+					: 'p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center'
+			}
+			onclick={() => setTool('pitch-mod-tool')}
+		>
+			Mod (5)
+		</button>
+		<button
+			type="button"
+			class={
+				editorState.tool === 'pitch-drift-tool'
+					? 'p:6px|8px bg:#333 fg:white r:6px flex ai:center jc:center'
+					: 'p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center'
+			}
+			onclick={() => setTool('pitch-drift-tool')}
+		>
+			Drift (6)
+		</button>
+		<button
+			type="button"
+			class={
+				editorState.tool === 'time-tool'
+					? 'p:6px|8px bg:#333 fg:white r:6px flex ai:center jc:center'
+					: 'p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center'
+			}
+			onclick={() => setTool('time-tool')}
+		>
+			Time (7)
+		</button>
+		<button
+			type="button"
+			class={
+				editorState.tool === 'formant-tool'
+					? 'p:6px|8px bg:#333 fg:white r:6px flex ai:center jc:center'
+					: 'p:6px|8px b:2px|solid|#333 r:6px flex ai:center jc:center'
+			}
+			onclick={() => setTool('formant-tool')}
+		>
+			Formant (8)
+		</button>
 	</div>
 
 	<div
@@ -446,6 +704,26 @@
 					}
 					stroke="rgba(0,0,0,0.35)"
 				/>
+				{#if editorState.selectedNoteIds.includes(n.id)}
+					<polyline
+						points={notePitchCurvePoints(n)}
+						fill="none"
+						stroke="rgba(0,0,0,0.65)"
+						stroke-width="1.5"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					/>
+					<text
+						x={r.x + r.w - 4}
+						y={r.y + r.h - 4}
+						text-anchor="end"
+						font-size="11"
+						fill="rgba(0,0,0,0.65)"
+						style="user-select:none"
+					>
+						F:{formatSigned(n.formantShift)}
+					</text>
+				{/if}
 			{/each}
 
 			{#if drag && drag.mode === 'pen'}

@@ -22,6 +22,20 @@ export function yToSemitone(y: number, height: number, minSemitone: number, maxS
 	return clamp(semi, minSemitone, maxSemitone);
 }
 
+export function yToSemitoneFloat(
+	y: number,
+	height: number,
+	minSemitone: number,
+	maxSemitone: number
+): number {
+	const range = maxSemitone - minSemitone;
+	if (height <= 0 || range <= 0) return minSemitone;
+	const rowH = height / (range + 1);
+	const idx = y / rowH;
+	const semi = maxSemitone - idx;
+	return clamp(semi, minSemitone, maxSemitone);
+}
+
 export function semitoneToYTop(semitone: number, height: number, minSemitone: number, maxSemitone: number): number {
 	const range = maxSemitone - minSemitone;
 	if (height <= 0 || range <= 0) return 0;
