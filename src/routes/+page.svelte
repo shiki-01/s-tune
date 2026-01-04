@@ -5,10 +5,11 @@
     import { createNoteSegment, type NoteSegment, type NoteTrack } from '$lib/note-model';
     import NoteEditor from '$lib/components/NoteEditor.svelte';
     import SoundEditor from '$lib/components/SoundEditor.svelte';
+    import MacrosPanel from '$lib/components/MacrosPanel.svelte';
     import type { SoundEditorMode } from '$lib/components/SoundEditor.svelte';
-    import { createDummyPitchDetector } from '$lib/pitch-detection';
+    import { DummyPitchDetector } from '$lib/pitch-detection';
     import { detectNotesFromPitch, detectedNotesToNoteSegments, makeKey, snapMidiToScale, type ScaleName } from '$lib/note-detection';
-    import { createDefaultHarmonics, DEFAULT_HARMONICS_CONFIG, type HarmonicProfile, type TrackMeanSpectrum } from '$lib/sound-model';
+    import { createDefaultTrackSoundProfile, DEFAULT_HARMONICS_CONFIG, type HarmonicProfile, type TrackSoundProfile } from '$lib/sound-model';
     import test from '$lib/assets/test.wav?url'; //TODO: dev only
 
     // AudioWorkletは "実ファイルのURL" を addModule() へ渡す必要がある。
@@ -33,9 +34,7 @@
     let activePanel = $state<'notes' | 'sound'>('notes');
 
     let soundEditorMode = $state<SoundEditorMode>('track');
-    let trackMeanSpectrum = $state<TrackMeanSpectrum>({
-        harmonics: createDefaultHarmonics(DEFAULT_HARMONICS_CONFIG)
-    });
+    let trackSoundProfile = $state<TrackSoundProfile>(createDefaultTrackSoundProfile(DEFAULT_HARMONICS_CONFIG));
     let noteHarmonicProfiles = $state<Record<string, HarmonicProfile>>({});
 
     function getSelectedNote() {
@@ -58,15 +57,6 @@
         renderedBuffer = null;
     }
 
-    function updateSelectedNoteFormantShift(noteId: string, formantShift: number) {
-        if (!noteTrack) return;
-        noteTrack = {
-            ...noteTrack,
-            notes: noteTrack.notes.map((n) => (n.id === noteId ? { ...n, formantShift } : n))
-        };
-        renderedBuffer = null;
-    }
-
     const ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as const;
     let keyRootPc = $state(0);
     let scaleName = $state<ScaleName>('major');
@@ -74,22 +64,70 @@
 
     let lastAutoDetectedNoteCount = $state<number | null>(null);
 
+    // Auto-detected note tracking:
+    // - base: the last auto-applied target baseSemitone (= snapped)
+    // - locked: once the user edits baseSemitone manually, we stop overwriting it
+    type AutoNoteState = { base: number; locked: boolean };
+    let autoNoteStates = $state<Record<string, AutoNoteState>>({});
+
+    function pruneAutoNoteStates(track: NoteTrack) {
+        const alive = new Set(track.notes.map((n) => n.id));
+        const next: Record<string, AutoNoteState> = {};
+        for (const [id, st] of Object.entries(autoNoteStates)) {
+            if (alive.has(id)) next[id] = st;
+        }
+        autoNoteStates = next;
+    }
+
     function resnapExistingNotes() {
         if (!noteTrack) return;
+        pruneAutoNoteStates(noteTrack);
+
+        const nextStates: Record<string, AutoNoteState> = { ...autoNoteStates };
+
         noteTrack = {
             ...noteTrack,
-            notes: noteTrack.notes.map((n) => ({ ...n, snappedSemitone: snapMidiToScale(n.baseSemitone, key()) }))
+            notes: noteTrack.notes.map((n) => {
+                const st = nextStates[n.id];
+                if (!st) {
+                    // 非Autoノートは上書きしない（手編集を尊重）
+                    return n;
+                }
+
+                const snapped = snapMidiToScale(n.sourceSemitone, key());
+
+                // 手でbaseSemitoneを変えたらロック
+                if (!st.locked && Math.abs(n.baseSemitone - st.base) > 1e-6) nextStates[n.id] = { ...st, locked: true };
+
+                const lockedNow = nextStates[n.id]?.locked ?? st.locked;
+                if (lockedNow) {
+                    return { ...n, snappedSemitone: snapped };
+                }
+
+                nextStates[n.id] = { base: snapped, locked: false };
+                return { ...n, snappedSemitone: snapped, baseSemitone: snapped };
+            })
         };
+
+        autoNoteStates = nextStates;
     }
 
     async function autoDetectNotes() {
         if (!loadedBuffer) return;
         if (!noteTrack) noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
 
-        const detector = createDummyPitchDetector();
+        const detector = new DummyPitchDetector();
         const frames = await detector.detectPitch(loadedBuffer);
         const detected = detectNotesFromPitch(frames);
         const nextNotes = detectedNotesToNoteSegments(detected, key());
+
+        // Register auto-detected notes for key/scale follow.
+        const nextStates: Record<string, AutoNoteState> = {};
+        for (const n of nextNotes) {
+            const snapped = n.snappedSemitone ?? n.baseSemitone;
+            nextStates[n.id] = { base: snapped, locked: false };
+        }
+        autoNoteStates = nextStates;
 
         noteTrack = { ...noteTrack, notes: nextNotes };
         selectedNoteIds = nextNotes[0]?.id ? [nextNotes[0].id] : [];
@@ -136,14 +174,46 @@
         const base = 60;
         if (duration >= 4) {
             return [
-                createNoteSegment({ startTime: 0, endTime: 2, baseSemitone: base, pitchOffset: 3, enabled: true }),
-                createNoteSegment({ startTime: Math.max(0, duration - 2), endTime: duration, baseSemitone: base, pitchOffset: -3, enabled: true })
+                createNoteSegment({
+                    startTime: 0,
+                    endTime: 2,
+                    sourceStartTime: 0,
+                    sourceEndTime: 2,
+                    sourceSemitone: base,
+                    baseSemitone: base + 3,
+                    enabled: true
+                }),
+                createNoteSegment({
+                    startTime: Math.max(0, duration - 2),
+                    endTime: duration,
+                    sourceStartTime: Math.max(0, duration - 2),
+                    sourceEndTime: duration,
+                    sourceSemitone: base,
+                    baseSemitone: base - 3,
+                    enabled: true
+                })
             ];
         }
         const mid = duration * 0.5;
         return [
-            createNoteSegment({ startTime: 0, endTime: mid, baseSemitone: base, pitchOffset: 3, enabled: true }),
-            createNoteSegment({ startTime: mid, endTime: duration, baseSemitone: base, pitchOffset: -3, enabled: true })
+            createNoteSegment({
+                startTime: 0,
+                endTime: mid,
+                sourceStartTime: 0,
+                sourceEndTime: mid,
+                sourceSemitone: base,
+                baseSemitone: base + 3,
+                enabled: true
+            }),
+            createNoteSegment({
+                startTime: mid,
+                endTime: duration,
+                sourceStartTime: mid,
+                sourceEndTime: duration,
+                sourceSemitone: base,
+                baseSemitone: base - 3,
+                enabled: true
+            })
         ];
     }
 
@@ -151,15 +221,6 @@
         if (!noteTrack) return;
         const hit = noteTrack.notes.find((n) => timeSec >= n.startTime && timeSec < n.endTime);
         selectedNoteIds = hit?.id ? [hit.id] : [];
-    }
-
-    function updateSelectedPitchOffset(v: number) {
-        const selectedNoteId = selectedNoteIds[0];
-        if (!noteTrack || !selectedNoteId) return;
-        noteTrack = {
-            ...noteTrack,
-            notes: noteTrack.notes.map((n) => (n.id === selectedNoteId ? { ...n, pitchOffset: v } : n))
-        };
     }
 
     function updateSelectedEnabled(checked: boolean) {
@@ -185,19 +246,20 @@
 
         const engine = new MelodyEngine(noteTrack.sampleRate);
         const enabledNotes = noteTrack.notes.filter((n) => n.enabled && n.endTime > n.startTime);
-        const starts = new Float32Array(enabledNotes.map((n) => n.startTime));
-        const ends = new Float32Array(enabledNotes.map((n) => n.endTime));
+        const srcStarts = new Float32Array(enabledNotes.map((n) => n.sourceStartTime));
+        const srcEnds = new Float32Array(enabledNotes.map((n) => n.sourceEndTime));
+        const dstStarts = new Float32Array(enabledNotes.map((n) => n.startTime));
+        const dstEnds = new Float32Array(enabledNotes.map((n) => n.endTime));
+
+        const srcSemitones = new Float32Array(enabledNotes.map((n) => n.sourceSemitone));
         const baseSemitones = new Float32Array(enabledNotes.map((n) => n.baseSemitone));
-        const offsets = new Float32Array(enabledNotes.map((n) => n.pitchOffset));
         const centerOffsets = new Float32Array(enabledNotes.map((n) => n.pitchCenterOffset));
-        const modAmounts = new Float32Array(enabledNotes.map((n) => n.pitchModAmount));
-        const driftAmounts = new Float32Array(enabledNotes.map((n) => n.pitchDriftAmount));
-        const timeStretchStarts = new Float32Array(enabledNotes.map((n) => n.timeStretchStart));
-        const timeStretchEnds = new Float32Array(enabledNotes.map((n) => n.timeStretchEnd));
+        const vibratoDepths = new Float32Array(enabledNotes.map((n) => n.vibratoDepth));
+        const pitchDrifts = new Float32Array(enabledNotes.map((n) => n.pitchDrift));
         const formantShifts = new Float32Array(enabledNotes.map((n) => n.formantShift));
 
-        const harmonicsPerNote = Math.max(1, Math.floor(trackMeanSpectrum.harmonics.length));
-        const trackGains = new Float32Array(trackMeanSpectrum.harmonics);
+        const harmonicsPerNote = Math.max(1, Math.floor(trackSoundProfile.harmonics.length));
+        const trackGains = new Float32Array(trackSoundProfile.harmonics);
         const noteHarmonicsFlat = new Float32Array(enabledNotes.length * harmonicsPerNote);
         for (let i = 0; i < enabledNotes.length; i++) {
             const noteId = enabledNotes[i]!.id;
@@ -210,6 +272,7 @@
 
         const anyEngine = engine as unknown as {
             set_harmonic_gains?: (gains: Float32Array) => void;
+            set_track_formant_shift?: (shift_semitones: number) => void;
             set_notes: (...args: unknown[]) => void;
         };
 
@@ -218,12 +281,39 @@
             anyEngine.set_harmonic_gains(trackGains);
         }
 
-        // Prefer new signature when available; otherwise, fall back.
+        if (typeof anyEngine.set_track_formant_shift === 'function') {
+            anyEngine.set_track_formant_shift(trackSoundProfile.formantShift);
+        }
+
+        // Prefer newest signature when available; otherwise, fall back.
         const declaredArgs = (anyEngine.set_notes as unknown as Function).length;
-        if (declaredArgs >= 11) {
+        if (declaredArgs >= 12) {
+            // src/dst timing + absolute pitch mapping (src->base) + center/drift
             anyEngine.set_notes(
-                starts,
-                ends,
+                srcStarts,
+                srcEnds,
+                dstStarts,
+                dstEnds,
+                srcSemitones,
+                baseSemitones,
+                centerOffsets,
+                vibratoDepths,
+                pitchDrifts,
+                formantShifts,
+                harmonicsPerNote,
+                noteHarmonicsFlat
+            );
+        } else if (declaredArgs >= 11) {
+            // Old signature: approximate by converting absolute pitch delta into a single offset.
+            const offsets = new Float32Array(enabledNotes.map((n) => n.baseSemitone - n.sourceSemitone));
+            const modAmounts = new Float32Array(enabledNotes.map((n) => n.vibratoDepth));
+            const driftAmounts = new Float32Array(enabledNotes.map((n) => 0));
+            const timeStretchStarts = new Float32Array(enabledNotes.map(() => 1));
+            const timeStretchEnds = new Float32Array(enabledNotes.map(() => 1));
+
+            anyEngine.set_notes(
+                dstStarts,
+                dstEnds,
                 baseSemitones,
                 offsets,
                 centerOffsets,
@@ -236,9 +326,16 @@
                 noteHarmonicsFlat
             );
         } else {
+            // Very old signature.
+            const offsets = new Float32Array(enabledNotes.map((n) => n.baseSemitone - n.sourceSemitone));
+            const modAmounts = new Float32Array(enabledNotes.map((n) => n.vibratoDepth));
+            const driftAmounts = new Float32Array(enabledNotes.map(() => 0));
+            const timeStretchStarts = new Float32Array(enabledNotes.map(() => 1));
+            const timeStretchEnds = new Float32Array(enabledNotes.map(() => 1));
+
             anyEngine.set_notes(
-                starts,
-                ends,
+                dstStarts,
+                dstEnds,
                 offsets,
                 centerOffsets,
                 modAmounts,
@@ -313,6 +410,7 @@
         noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
         selectedNoteIds = [];
         lastAutoDetectedNoteCount = null;
+		autoNoteStates = {};
     }
 
     async function play() {
@@ -379,6 +477,7 @@
             noteTrack = ensureNoteTrackFromBuffer(loadedBuffer);
             loadedName = 'text.wav';
             selectedNoteIds = [];
+			autoNoteStates = {};
         } catch (e) {
             console.error('Default audio load failed', e);
         }
@@ -477,6 +576,7 @@
                 noteTrack = { ...noteTrack, notes: makePresetNotes(noteTrack.duration) };
                 selectedNoteIds = noteTrack.notes[0]?.id ? [noteTrack.notes[0].id] : [];
                 lastAutoDetectedNoteCount = null;
+				autoNoteStates = {};
             }}
             disabled={!loadedBuffer}
         >
@@ -497,31 +597,51 @@
     </div>
 
     {#if noteTrack && activePanel === 'notes'}
-        <NoteEditor
-            track={noteTrack}
-            selectedNoteIds={selectedNoteIds}
-            onSelect={(ids) => (selectedNoteIds = ids)}
-            onChange={(t) => {
-                noteTrack = t;
-                renderedBuffer = null;
-            }}
-        />
+        <div class="flex flex:row gap:20px">
+            <div style="flex:1; min-width:520px;">
+                <NoteEditor
+                    track={noteTrack}
+                    selectedNoteIds={selectedNoteIds}
+                    onSelect={(ids) => (selectedNoteIds = ids)}
+                    onChange={(t) => {
+                        noteTrack = t;
+                        renderedBuffer = null;
+                    }}
+                />
+            </div>
+
+            <div class="p:10px b:2px|solid|#333 r:8px" style="width:320px;">
+                <div class="opacity:0.9" style="margin-bottom:10px;">Macros</div>
+                <MacrosPanel
+                    track={noteTrack}
+                    selectedNoteIds={selectedNoteIds}
+                    keyScale={key()}
+                    onChange={(t) => {
+                        noteTrack = t;
+                        renderedBuffer = null;
+                    }}
+                />
+            </div>
+        </div>
     {/if}
 
     {#if noteTrack && activePanel === 'sound'}
         <SoundEditor
             mode={soundEditorMode}
-            trackHarmonics={trackMeanSpectrum.harmonics}
+            trackHarmonics={trackSoundProfile.harmonics}
+            trackFormantShift={trackSoundProfile.formantShift}
             selectedNoteId={selectedNoteIds[0] ?? null}
             selectedNoteHarmonics={getSelectedNoteHarmonics()}
-            selectedNoteFormantShift={getSelectedNote()?.formantShift ?? null}
             onChangeMode={(m) => (soundEditorMode = m)}
             onChangeTrackHarmonics={(h) => {
-                trackMeanSpectrum = { ...trackMeanSpectrum, harmonics: h };
+                trackSoundProfile = { ...trackSoundProfile, harmonics: h };
+                renderedBuffer = null;
+            }}
+            onChangeTrackFormantShift={(v) => {
+                trackSoundProfile = { ...trackSoundProfile, formantShift: v };
                 renderedBuffer = null;
             }}
             onChangeSelectedNoteHarmonics={(noteId, h) => upsertNoteHarmonics(noteId, h)}
-            onChangeSelectedNoteFormantShift={(noteId, v) => updateSelectedNoteFormantShift(noteId, v)}
         />
     {/if}
 </section>

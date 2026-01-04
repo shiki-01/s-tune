@@ -2,24 +2,27 @@ import { v4 as uuidv4 } from 'uuid';
 
 export interface NoteSegment {
 	id: string;
+	// --- output placement (editable with Timing tool)
 	startTime: number; // seconds
 	endTime: number; // seconds
-	baseSemitone: number; // e.g. MIDI note number (placeholder for later F0)
+
+	// --- source slice (used by DSP when timing shifts)
+	sourceStartTime: number; // seconds
+	sourceEndTime: number; // seconds
+
+	// --- pitch
+	sourceSemitone: number; // original/estimated (MIDI-like)
+	baseSemitone: number; // coarse target (MIDI-like)
+	pitchCenterOffset: number; // fine average offset (semitones; 0.01 = 1 cent)
+	pitchDrift: number; // semitone drift added linearly toward note end
+	vibratoDepth: number; // semitones (0 = none)
 	// recommendation / snap (optional)
 	snappedSemitone?: number; // recommended pitch (MIDI) in selected key/scale
-	pitchOffset: number; // semitones
 	enabled: boolean;
+	// selection (optional; used by macro UI helpers)
+	selected?: boolean;
 
-	// tuning (Melodyne-like)
-	pitchCenterOffset: number; // semitones
-	pitchModAmount: number; // 0..2 (0 = flat)
-	pitchDriftAmount: number; // 0..2 (0 = no drift)
-
-	// timing (prep)
-	timeStretchStart: number; // 1.0 = original
-	timeStretchEnd: number; // 1.0 = original
-
-	// formant (prep)
+	// formant (optional; used by SoundEditor)
 	formantShift: number; // semitone-ish, 0 = original
 }
 
@@ -33,16 +36,17 @@ export type NoteSegmentInit = {
 	id?: string;
 	startTime: number;
 	endTime: number;
+	sourceStartTime?: number;
+	sourceEndTime?: number;
+	sourceSemitone?: number;
 	baseSemitone: number;
 	snappedSemitone?: number;
-	pitchOffset?: number;
 	enabled?: boolean;
 	pitchCenterOffset?: number;
-	pitchModAmount?: number;
-	pitchDriftAmount?: number;
-	timeStretchStart?: number;
-	timeStretchEnd?: number;
+	pitchDrift?: number;
+	vibratoDepth?: number;
 	formantShift?: number;
+	selected?: boolean;
 };
 
 export function createNoteSegment(init: NoteSegmentInit): NoteSegment {
@@ -50,15 +54,16 @@ export function createNoteSegment(init: NoteSegmentInit): NoteSegment {
 		id: init.id ?? uuidv4(),
 		startTime: init.startTime,
 		endTime: init.endTime,
+		sourceStartTime: init.sourceStartTime ?? init.startTime,
+		sourceEndTime: init.sourceEndTime ?? init.endTime,
+		sourceSemitone: init.sourceSemitone ?? init.baseSemitone,
 		baseSemitone: init.baseSemitone,
 		snappedSemitone: init.snappedSemitone ?? init.baseSemitone,
-		pitchOffset: init.pitchOffset ?? 0,
 		enabled: init.enabled ?? true,
 		pitchCenterOffset: init.pitchCenterOffset ?? 0,
-		pitchModAmount: init.pitchModAmount ?? 1,
-		pitchDriftAmount: init.pitchDriftAmount ?? 1,
-		timeStretchStart: init.timeStretchStart ?? 1,
-		timeStretchEnd: init.timeStretchEnd ?? 1,
-		formantShift: init.formantShift ?? 0
+		pitchDrift: init.pitchDrift ?? 0,
+		vibratoDepth: init.vibratoDepth ?? 0,
+		formantShift: init.formantShift ?? 0,
+		selected: init.selected
 	};
 }

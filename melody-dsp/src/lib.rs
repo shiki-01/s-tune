@@ -17,6 +17,10 @@ pub struct MelodyShifter {
     buffer: Vec<f32>,
     write_idx: usize,
     delay_pos: f32,
+
+    // Smooth ratio changes to avoid clicks when semitones changes abruptly.
+    ratio: f32,
+    ratio_alpha: f32,
 }
 
 #[wasm_bindgen]
@@ -27,12 +31,24 @@ impl MelodyShifter {
         let mut max_delay = (sample_rate * 0.04).round() as usize;
         max_delay = max_delay.clamp(256, 16384);
 
+        // 10ms smoothing is a good tradeoff for click reduction without feeling laggy.
+        let tau_sec = 0.010_f32;
+        let ratio_alpha = if sample_rate.is_finite() && sample_rate > 0.0 {
+            // alpha = 1 - exp(-1/(sr*tau))
+            1.0 - (-1.0 / (sample_rate * tau_sec)).exp()
+        } else {
+            1.0
+        };
+
         MelodyShifter {
             sample_rate,
             max_delay,
             buffer: vec![0.0; max_delay],
             write_idx: 0,
             delay_pos: 0.0,
+
+            ratio: 1.0,
+            ratio_alpha: ratio_alpha.max(0.0).min(1.0),
         }
     }
 
@@ -47,19 +63,23 @@ impl MelodyShifter {
         }
 
         // semitones + は高く、- は低く
-        let mut ratio = (2.0_f32).powf(semitones / 12.0);
-        if !ratio.is_finite() || ratio <= 0.0 {
-            ratio = 1.0;
+        let mut target_ratio = (2.0_f32).powf(semitones / 12.0);
+        if !target_ratio.is_finite() || target_ratio <= 0.0 {
+            target_ratio = 1.0;
         }
         // 極端な値は暴れるので軽く制限
-        ratio = ratio.clamp(0.5, 2.0);
+        target_ratio = target_ratio.clamp(0.5, 2.0);
 
-        let bypass = semitones.abs() < 1.0e-3 || (ratio - 1.0).abs() < 1.0e-3;
         let len = self.max_delay as f32;
         let half = len * 0.5;
 
         for x in input.iter_mut() {
             let in_sample = *x;
+
+            // Smooth ratio changes sample-by-sample.
+            self.ratio += (target_ratio - self.ratio) * self.ratio_alpha;
+            let ratio = self.ratio;
+            let bypass = (ratio - 1.0).abs() < 1.0e-3;
 
             // write
             self.buffer[self.write_idx] = in_sample;
@@ -126,25 +146,52 @@ fn read_delay_interp(buffer: &[f32], write_idx: usize, delay: f32) -> f32 {
     a + (b - a) * frac
 }
 
+fn resample_linear(input: &[f32], out_len: usize) -> Vec<f32> {
+    if out_len == 0 {
+        return Vec::new();
+    }
+    if input.is_empty() {
+        return vec![0.0; out_len];
+    }
+    if input.len() == 1 {
+        return vec![input[0]; out_len];
+    }
+    if out_len == 1 {
+        return vec![input[0]];
+    }
+
+    let in_len_f = (input.len() - 1) as f32;
+    let out_len_f = (out_len - 1) as f32;
+    let mut out: Vec<f32> = Vec::with_capacity(out_len);
+
+    for i in 0..out_len {
+        let pos = (i as f32) * (in_len_f / out_len_f);
+        let i0 = pos.floor() as usize;
+        let frac = pos - (i0 as f32);
+        let i1 = (i0 + 1).min(input.len() - 1);
+        let a = input[i0];
+        let b = input[i1];
+        out.push(a + (b - a) * frac);
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 struct NoteSpan {
-    start: f32,
-    end: f32,
+    // --- source slice (input)
+    src_start: f32,
+    src_end: f32,
 
-    // absolute pitch reference (MIDI note number)
-    base_semitone: f32,
+    // --- destination placement (output)
+    dst_start: f32,
+    dst_end: f32,
 
-    // pitch (semitones)
-    pitch_offset: f32,
-    pitch_center_offset: f32,
-
-    // 0..2 (UI側でクランプしているが念のため)
-    pitch_mod_amount: f32,
-    pitch_drift_amount: f32,
-
-    // timing (not applied yet)
-    time_stretch_start: f32,
-    time_stretch_end: f32,
+    // pitch mapping
+    source_semitone: f32, // original/estimated (MIDI-like)
+    base_semitone: f32,   // coarse target (MIDI-like)
+    pitch_center_offset: f32, // fine (semitones)
+    vibrato_depth: f32,       // semitones
+    pitch_drift: f32,         // semitones (linear to end)
 
     // formant (not applied yet)
     formant_shift: f32,
@@ -165,6 +212,16 @@ impl HarmonicEQ {
     fn gain(&self, idx: usize) -> f32 {
         // idx: 0 => harmonic 1
         self.gains.get(idx).copied().unwrap_or(1.0)
+    }
+}
+
+struct TrackFormant {
+    shift_semitones: f32,
+}
+
+impl TrackFormant {
+    fn new() -> Self {
+        Self { shift_semitones: 0.0 }
     }
 }
 
@@ -230,14 +287,8 @@ impl Biquad {
 pub struct MelodyEngine {
     sample_rate: f32,
     notes: Vec<NoteSpan>,
-    shifter: MelodyShifter,
     harmonic_eq: HarmonicEQ,
-
-    // stateful timbre processing to avoid clicks at block boundaries
-    timbre_active_note_idx: Option<usize>,
-    timbre_filters: Vec<Biquad>,
-    timbre_lp: f32,
-    timbre_last_f0: f32,
+    track_formant: TrackFormant,
 }
 
 #[wasm_bindgen]
@@ -247,13 +298,9 @@ impl MelodyEngine {
         MelodyEngine {
             sample_rate,
             notes: Vec::new(),
-            shifter: MelodyShifter::new(sample_rate),
             harmonic_eq: HarmonicEQ::new(),
 
-            timbre_active_note_idx: None,
-            timbre_filters: Vec::new(),
-            timbre_lp: 0.0,
-            timbre_last_f0: 0.0,
+            track_formant: TrackFormant::new(),
         }
     }
 
@@ -271,75 +318,91 @@ impl MelodyEngine {
         self.harmonic_eq.gains = out;
     }
 
+    #[wasm_bindgen]
+    pub fn set_track_formant_shift(&mut self, shift_semitones: f32) {
+        if shift_semitones.is_finite() {
+            self.track_formant.shift_semitones = shift_semitones.max(-24.0).min(24.0);
+        }
+    }
+
     /// ノート情報をセットする。
-    /// - note_starts / note_ends: 秒
-    /// - note_offsets: 半音（+で高く、-で低く）
-    /// - pitch_center_offsets: 半音（ピッチセンター）
-    /// - pitch_mod_amounts / pitch_drift_amounts: 0..2（量）
-    /// - time_stretch_starts / time_stretch_ends: 0.5..2.0（倍率、現状未適用）
+    /// - src_starts / src_ends: 入力から切り出す区間（秒）
+    /// - dst_starts / dst_ends: 出力へ配置する区間（秒）
+    /// - source_semitones / base_semitones: 入力→ターゲットの音高（MIDI相当）
+    /// - pitch_center_offsets: 半音（微調整、0.01=1cent）
+    /// - vibrato_depths: 半音（0=なし）
+    /// - pitch_drifts: 半音（ノート末尾へ向けて線形に加算）
     /// - formant_shifts: 半音（現状未適用）
     #[wasm_bindgen]
     pub fn set_notes(
         &mut self,
-        note_starts: Vec<f32>,
-        note_ends: Vec<f32>,
+        src_starts: Vec<f32>,
+        src_ends: Vec<f32>,
+        dst_starts: Vec<f32>,
+        dst_ends: Vec<f32>,
+        source_semitones: Vec<f32>,
         base_semitones: Vec<f32>,
-        note_offsets: Vec<f32>,
         pitch_center_offsets: Vec<f32>,
-        pitch_mod_amounts: Vec<f32>,
-        pitch_drift_amounts: Vec<f32>,
-        time_stretch_starts: Vec<f32>,
-        time_stretch_ends: Vec<f32>,
+        vibrato_depths: Vec<f32>,
+        pitch_drifts: Vec<f32>,
         formant_shifts: Vec<f32>,
         harmonics_per_note: u32,
         note_harmonics_flat: Vec<f32>,
     ) {
-        let n = note_starts
+        let n = src_starts
             .len()
-            .min(note_ends.len())
+            .min(src_ends.len())
+            .min(dst_starts.len())
+            .min(dst_ends.len())
+            .min(source_semitones.len())
             .min(base_semitones.len())
-            .min(note_offsets.len())
             .min(pitch_center_offsets.len())
-            .min(pitch_mod_amounts.len())
-            .min(pitch_drift_amounts.len())
-            .min(time_stretch_starts.len())
-            .min(time_stretch_ends.len())
+            .min(vibrato_depths.len())
+            .min(pitch_drifts.len())
             .min(formant_shifts.len());
 
         self.notes.clear();
         self.notes.reserve(n);
 
         for i in 0..n {
-            let s = note_starts[i];
-            let e = note_ends[i];
-            let base = base_semitones[i];
-            let o = note_offsets[i];
+            let src_s = src_starts[i];
+            let src_e = src_ends[i];
+            let dst_s = dst_starts[i];
+            let dst_e = dst_ends[i];
+            let src_midi = source_semitones[i];
+            let base_midi = base_semitones[i];
             let pc = pitch_center_offsets[i];
-            let pm = pitch_mod_amounts[i];
-            let pd = pitch_drift_amounts[i];
-            let ts_s = time_stretch_starts[i];
-            let ts_e = time_stretch_ends[i];
+            let vib = vibrato_depths[i];
+            let drift = pitch_drifts[i];
             let f = formant_shifts[i];
 
-            if !s.is_finite()
-                || !e.is_finite()
-                || !base.is_finite()
-                || !o.is_finite()
+            if !src_s.is_finite()
+                || !src_e.is_finite()
+                || !dst_s.is_finite()
+                || !dst_e.is_finite()
+                || !src_midi.is_finite()
+                || !base_midi.is_finite()
                 || !pc.is_finite()
-                || !pm.is_finite()
-                || !pd.is_finite()
-                || !ts_s.is_finite()
-                || !ts_e.is_finite()
+                || !vib.is_finite()
+                || !drift.is_finite()
                 || !f.is_finite()
             {
                 continue;
             }
-            if e <= s {
+            if src_e <= src_s {
+                continue;
+            }
+            if dst_e <= dst_s {
                 continue;
             }
 
-            let clamp_amount_0_2 = |v: f32| v.max(0.0).min(2.0);
-            let clamp_stretch_05_2 = |v: f32| v.max(0.5).min(2.0);
+            let clamp_semi = |v: f32| {
+                if v.is_finite() {
+                    v.max(-24.0).min(24.0)
+                } else {
+                    0.0
+                }
+            };
 
             let hp = harmonics_per_note as usize;
             let mut profile: Vec<f32> = Vec::new();
@@ -356,33 +419,34 @@ impl MelodyEngine {
                 }
             }
             self.notes.push(NoteSpan {
-                start: s.max(0.0),
-                end: e.max(0.0),
-                base_semitone: base,
-                pitch_offset: o,
-                pitch_center_offset: pc,
-                pitch_mod_amount: clamp_amount_0_2(pm),
-                pitch_drift_amount: clamp_amount_0_2(pd),
-                time_stretch_start: clamp_stretch_05_2(ts_s),
-                time_stretch_end: clamp_stretch_05_2(ts_e),
+                src_start: src_s.max(0.0),
+                src_end: src_e.max(0.0),
+                dst_start: dst_s.max(0.0),
+                dst_end: dst_e.max(0.0),
+                source_semitone: src_midi,
+                base_semitone: base_midi,
+                pitch_center_offset: clamp_semi(pc),
+                vibrato_depth: clamp_semi(vib.max(0.0)),
+                pitch_drift: clamp_semi(drift),
                 formant_shift: f,
                 harmonic_profile: profile,
             });
         }
 
-        // まずは単純に start でソート（重なりや包含は未定義）
-        self.notes.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        // まずは単純に dst_start でソート（重なりや包含は加算合成）
+        self.notes
+            .sort_by(|a, b| a.dst_start.partial_cmp(&b.dst_start).unwrap_or(std::cmp::Ordering::Equal));
 
-        // reset timbre state (note indices/profiles may have changed)
-        self.timbre_active_note_idx = None;
-        self.timbre_filters.clear();
-        self.timbre_lp = 0.0;
-        self.timbre_last_f0 = 0.0;
+        // note list replaced; no other state to reset
     }
 
     /// input(モノラル)をノート配列に従って in-place で処理する。
     ///
-    /// 「属するノートがあればそのoffsetでピッチシフト、なければバイパス」という仕様。
+    /// 現段階の仕様（まずは「触って反映される」優先）:
+    /// - 各ノートごとに src_start/src_end から入力スライスを切り出す
+    /// - dst_start/dst_end へ配置して加算合成
+    /// - 重なりは単純に加算、隙間は無音
+    /// - 境界は短いフェードでクリックを抑制
     #[wasm_bindgen]
     pub fn process_buffer(&mut self, input: &mut [f32]) {
         if input.is_empty() {
@@ -397,124 +461,159 @@ impl MelodyEngine {
             return;
         }
 
-        // ノート内パラメータを「時間で変化するピッチ」に反映するため、
-        // note.end だけでなく固定ブロックで区切って shifter に渡す。
         const BLOCK_SAMPLES: usize = 128;
-        const MOD_HZ: f32 = 5.5;
-        const MOD_AMP_SEMI: f32 = 0.25;
-        const DRIFT_AMP_SEMI: f32 = 0.2;
-        const TIME_RAMP_BASE_SEC: f32 = 0.03;
+        const VIB_HZ: f32 = 5.5;
 
-        // 区間ごとに処理：ノート境界で slice を切り替える
-        let mut sample_idx: usize = 0;
-        let mut note_idx: usize = 0;
+        let original: Vec<f32> = input.to_vec();
+        // Preserve original where there are no notes, and overwrite (crossfade) where notes exist.
+        // This is intentionally "replacement-ish": if notes overlap, later notes win.
+        let mut out: Vec<f32> = original.clone();
 
-        while sample_idx < input.len() {
-            let t = (sample_idx as f32) / sr;
+        let fade_len = ((sr * 0.010).round() as usize).clamp(0, 4096); // 10ms
 
-            // t より前のノートを前進して捨てる
-            while note_idx < self.notes.len() && t >= self.notes[note_idx].end {
-                note_idx += 1;
+        for note in self.notes.iter() {
+            let src0 = (note.src_start * sr).round() as isize;
+            let src1 = (note.src_end * sr).round() as isize;
+            let dst0 = (note.dst_start * sr).round() as isize;
+            let dst1 = (note.dst_end * sr).round() as isize;
+
+            let len = original.len() as isize;
+            let src0 = src0.clamp(0, len);
+            let src1 = src1.clamp(0, len);
+            let dst0 = dst0.clamp(0, len);
+            let dst1 = dst1.clamp(0, len);
+
+            if src1 <= src0 + 1 {
+                continue;
+            }
+            if dst1 <= dst0 + 1 {
+                continue;
             }
 
-            // 現在時刻がノート内かどうか
-            let (offset, next_boundary_time, active_note_idx) = if note_idx < self.notes.len() {
-                let note = &self.notes[note_idx];
-                if t >= note.start && t < note.end {
-                    // ブロック内は一定オフセットとして近似
-                    let block_end_sample = (sample_idx + BLOCK_SAMPLES).min(input.len());
-                    let block_end_time = (block_end_sample as f32) / sr;
-                    let next_time = note.end.min(block_end_time);
+            let src0u = src0 as usize;
+            let src1u = src1 as usize;
+            let dst0u = dst0 as usize;
+            let dst1u = dst1 as usize;
 
-                    let mid_sample = sample_idx as f32 + ((block_end_sample - sample_idx) as f32) * 0.5;
-                    let t_mid = mid_sample / sr;
-                    let dur = (note.end - note.start).max(1.0e-6);
-                    let mut u = (t_mid - note.start) / dur;
-                    if u < 0.0 {
-                        u = 0.0;
-                    }
-                    if u > 1.0 {
-                        u = 1.0;
-                    }
+            let src_slice = &original[src0u..src1u];
+            let dst_len = dst1u - dst0u;
 
-                    let center = note.pitch_offset + note.pitch_center_offset;
-                    let mod_part = (2.0 * PI * MOD_HZ * (t_mid - note.start)).sin()
-                        * (MOD_AMP_SEMI * note.pitch_mod_amount);
-                    let drift_part = (u - 0.5) * 2.0 * (DRIFT_AMP_SEMI * note.pitch_drift_amount);
-
-                    // time-tool の簡易実装：ノート頭/尻で補正量をランプさせる
-                    // （バッファ長は変えず、アタック/リリースの“タイミング感”だけ反映）
-                    let ramp_s = TIME_RAMP_BASE_SEC * note.time_stretch_start;
-                    let ramp_e = TIME_RAMP_BASE_SEC * note.time_stretch_end;
-                    let ramp_s = ramp_s.min(dur * 0.45).max(0.0);
-                    let ramp_e = ramp_e.min(dur * 0.45).max(0.0);
-
-                    let mut env: f32 = 1.0_f32;
-                    if ramp_s > 0.0_f32 {
-                        let a = (t_mid - note.start) / ramp_s;
-                        env = env.min(a.max(0.0_f32).min(1.0_f32));
-                    }
-                    if ramp_e > 0.0_f32 {
-                        let b = (note.end - t_mid) / ramp_e;
-                        env = env.min(b.max(0.0_f32).min(1.0_f32));
-                    }
-
-                    (
-                        (center + mod_part + drift_part) * env,
-                        next_time,
-                        Some(note_idx),
-                    )
-                } else {
-                    // 次のノート開始までバイパス（こちらも大きすぎないように固定ブロックで刻む）
-                    let block_end_sample = (sample_idx + BLOCK_SAMPLES).min(input.len());
-                    let block_end_time = (block_end_sample as f32) / sr;
-                    (0.0, note.start.min(block_end_time), None)
-                }
+            // Time-stretch (very rough): resample source slice to destination length.
+            let mut seg: Vec<f32> = if src_slice.len() == dst_len {
+                src_slice.to_vec()
             } else {
-                // 以降はノートなし
-                let block_end_sample = (sample_idx + BLOCK_SAMPLES).min(input.len());
-                (0.0, (block_end_sample as f32) / sr, None)
+                resample_linear(src_slice, dst_len)
             };
 
-            let mut end_sample = (next_boundary_time * sr).ceil() as isize;
-            if end_sample < 0 {
-                end_sample = 0;
+            if seg.len() < 2 {
+                continue;
             }
-            let end_sample = (end_sample as usize).min(input.len());
-            let end_sample = end_sample.max(sample_idx + 1);
 
-            let slice = &mut input[sample_idx..end_sample];
-            self.shifter.process_block(slice, offset);
+            // Apply time-varying pitch shift across the note.
+            let mut shifter = MelodyShifter::new(sr);
+            let dur_sec = (note.dst_end - note.dst_start).max(1.0e-6);
+            let base_shift = (note.base_semitone - note.source_semitone) + note.pitch_center_offset;
 
-            // Apply simple timbre shaping (harmonics + formant) for this note block.
-            if let Some(nidx) = active_note_idx {
-                // note changes => reset state to avoid carrying filter memories across notes
-                if self.timbre_active_note_idx != Some(nidx) {
-                    self.timbre_active_note_idx = Some(nidx);
-                    self.timbre_filters.clear();
-                    self.timbre_lp = 0.0;
-                    self.timbre_last_f0 = 0.0;
+            let mut idx: usize = 0;
+            while idx < seg.len() {
+                let end = (idx + BLOCK_SAMPLES).min(seg.len());
+                let mid = idx as f32 + ((end - idx) as f32) * 0.5;
+                let u = if seg.len() > 1 {
+                    (mid / ((seg.len() - 1) as f32)).max(0.0).min(1.0)
+                } else {
+                    0.0
+                };
+                let t_rel = u * dur_sec;
+                let vib = (2.0 * PI * VIB_HZ * t_rel).sin() * note.vibrato_depth;
+                let drift = note.pitch_drift * u;
+                let semitones = base_shift + vib + drift;
+                shifter.process_block(&mut seg[idx..end], semitones);
+                idx = end;
+            }
+
+            // Optional timbre shaping (harmonics/formant) using fresh per-note state.
+            // This avoids cross-note state bleed when timing shifts or overlaps.
+            let mut filters: Vec<Biquad> = Vec::new();
+            let mut lp: f32 = 0.0;
+            let mut last_f0: f32 = 0.0;
+            apply_harmonic_and_formant_stateful(
+                &mut seg,
+                sr,
+                &self.harmonic_eq,
+                note,
+                &mut filters,
+                &mut lp,
+                &mut last_f0,
+            );
+
+            let fade = fade_len.min(seg.len() / 2);
+            for i in 0..seg.len() {
+                let mut w = 1.0_f32;
+                if fade > 0 {
+                    let w_in = (i as f32 / fade as f32).min(1.0);
+                    let w_out = ((seg.len() - 1 - i) as f32 / fade as f32).min(1.0);
+                    w = w_in.min(w_out);
                 }
-
-                let note = &self.notes[nidx];
-                apply_harmonic_and_formant_stateful(
-                    slice,
-                    sr,
-                    &self.harmonic_eq,
-                    note,
-                    &mut self.timbre_filters,
-                    &mut self.timbre_lp,
-                    &mut self.timbre_last_f0,
-                );
+                let di = dst0u + i;
+                if di >= out.len() {
+                    break;
+                }
+                let x = out[di];
+                let mut y = x * (1.0 - w) + seg[i] * w;
+                if !y.is_finite() {
+                    y = 0.0;
+                } else {
+                    y = y.max(-1.0).min(1.0);
+                }
+                out[di] = y;
             }
-
-            sample_idx = end_sample;
         }
+
+        // Track-level formant shift (very rough): apply a gentle spectral tilt to the whole output.
+        apply_track_formant(&mut out, sr, self.track_formant.shift_semitones);
+
+        input.copy_from_slice(&out);
     }
 
     #[wasm_bindgen(getter)]
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+}
+
+fn apply_track_formant(input: &mut [f32], sr: f32, shift_semitones: f32) {
+    if input.is_empty() {
+        return;
+    }
+    if !sr.is_finite() || sr <= 0.0 {
+        return;
+    }
+    if !shift_semitones.is_finite() {
+        return;
+    }
+    let eps = 1.0e-3_f32;
+    if shift_semitones.abs() <= eps {
+        return;
+    }
+
+    let nyq = sr * 0.5;
+    let s = shift_semitones.max(-24.0).min(24.0);
+    let tilt = (2.0_f32).powf(s / 12.0);
+    let gain_hi = tilt.powf(0.5).max(0.5).min(2.0);
+    let gain_lo = (1.0 / tilt).powf(0.5).max(0.5).min(2.0);
+
+    // A single split point gives a "brighter/darker" feel without real formant shifting.
+    let fc = 900.0_f32.min(nyq * 0.9).max(80.0);
+    let a = (-2.0 * PI * fc / sr).exp();
+    let mut lp_state: f32 = 0.0;
+    for i in 0..input.len() {
+        let x = input[i];
+        lp_state = a * lp_state + (1.0 - a) * x;
+        let low = lp_state;
+        let high = x - low;
+        let mut y = low * gain_lo + high * gain_hi;
+        y = y.tanh();
+        input[i] = y.max(-1.0).min(1.0);
     }
 }
 
@@ -534,71 +633,104 @@ fn apply_harmonic_and_formant_stateful(
         return;
     }
 
-    // --- Harmonic EQ (very rough): filter bank around n*f0, then mix back.
-    // Use absolute pitch (base + center) as f0 reference.
-    let f0_midi = note.base_semitone + note.pitch_center_offset;
-    let f0 = midi_to_hz(f0_midi);
-    if !f0.is_finite() || f0 <= 0.0 {
+    let nyq = sr * 0.5;
+
+    // Bypass when everything is neutral to avoid unnecessary filtering artifacts.
+    // Default UI state sets all gains to 1.0 and formant_shift to 0.0.
+    let eps = 1.0e-3_f32;
+    let formant_active = note.formant_shift.is_finite() && note.formant_shift.abs() > eps;
+
+    let mut harmonic_active = false;
+    for &g in global_eq.gains.iter().take(24) {
+        if g.is_finite() && (g - 1.0).abs() > eps {
+            harmonic_active = true;
+            break;
+        }
+    }
+    if !harmonic_active {
+        for &g in note.harmonic_profile.iter().take(24) {
+            if g.is_finite() && (g - 1.0).abs() > eps {
+                harmonic_active = true;
+                break;
+            }
+        }
+    }
+
+    if !harmonic_active && !formant_active {
         return;
     }
 
-    // If f0 changed a lot, rebuild filters (and reset their states).
-    let rel_change = if (*last_f0).is_finite() && *last_f0 > 0.0 {
-        ((f0 - *last_f0) / *last_f0).abs()
-    } else {
-        1.0
-    };
-
-    let nyq = sr * 0.5;
-    let n_harm = global_eq.gains.len().max(note.harmonic_profile.len()).min(24);
-
-    // Ensure filters match current f0/harmonic count.
-    let desired = (1..=n_harm)
-        .map(|h| f0 * (h as f32))
-        .take_while(|&f| f.is_finite() && f < nyq * 0.98)
-        .count();
-
-    let need_rebuild = filters.len() != desired || rel_change > 0.08;
-    if need_rebuild {
-        filters.clear();
-        let q = 12.0;
-        for h in 0..desired {
-            let harm_idx = (h + 1) as f32;
-            let f = f0 * harm_idx;
-            filters.push(Biquad::new_bandpass(sr, f, q));
+    // --- Harmonic EQ (very rough): filter bank around n*f0, then mix back.
+    // Use absolute pitch (base + center) as f0 reference.
+    // Only run if gains are actually non-neutral.
+    let mut f0: f32 = 0.0;
+    if harmonic_active {
+        let f0_midi = note.base_semitone + note.pitch_center_offset;
+        f0 = midi_to_hz(f0_midi);
+        if !f0.is_finite() || f0 <= 0.0 {
+            // If f0 is invalid, skip harmonic EQ but still allow formant.
+            harmonic_active = false;
         }
-        *last_f0 = f0;
     }
 
-    // Keep it subtle: this is not a true EQ, it's a rough "timbre feel".
-    let mix = 0.25_f32;
-    let n_filt = filters.len().max(1) as f32;
+    if harmonic_active {
+        // If f0 changed a lot, rebuild filters (and reset their states).
+        let rel_change = if (*last_f0).is_finite() && *last_f0 > 0.0 {
+            ((f0 - *last_f0) / *last_f0).abs()
+        } else {
+            1.0
+        };
 
-    for i in 0..input.len() {
-        let x = input[i];
-        let mut acc = 0.0_f32;
+        let n_harm = global_eq.gains.len().max(note.harmonic_profile.len()).min(24);
 
-        for (h, filt) in filters.iter_mut().enumerate() {
-            let g_global = global_eq.gain(h);
-            let g_note = note.harmonic_profile.get(h).copied().unwrap_or(1.0);
-            // Cap per-harmonic gain to avoid blowing up when summing many harmonics.
-            let g = (g_global * g_note).max(0.0).min(2.0);
-            acc += filt.process(x) * g;
+        // Ensure filters match current f0/harmonic count.
+        let desired = (1..=n_harm)
+            .map(|h| f0 * (h as f32))
+            .take_while(|&f| f.is_finite() && f < nyq * 0.98)
+            .count();
+
+        let need_rebuild = filters.len() != desired || rel_change > 0.08;
+        if need_rebuild {
+            filters.clear();
+            let q = 12.0;
+            for h in 0..desired {
+                let harm_idx = (h + 1) as f32;
+                let f = f0 * harm_idx;
+                filters.push(Biquad::new_bandpass(sr, f, q));
+            }
+            *last_f0 = f0;
         }
 
-        // Normalize the summed band outputs.
-        acc /= n_filt;
+        // Keep it subtle: this is not a true EQ, it's a rough "timbre feel".
+        let mix = 0.25_f32;
+        let n_filt = filters.len().max(1) as f32;
 
-        let mut y = x * (1.0 - mix) + acc * mix;
-        // Simple limiter/soft clip to prevent hard digital clipping.
-        y = y.tanh();
-        input[i] = y.max(-1.0).min(1.0);
+        for i in 0..input.len() {
+            let x = input[i];
+            let mut acc = 0.0_f32;
+
+            for (h, filt) in filters.iter_mut().enumerate() {
+                let g_global = global_eq.gain(h);
+                let g_note = note.harmonic_profile.get(h).copied().unwrap_or(1.0);
+                // Cap per-harmonic gain to avoid blowing up when summing many harmonics.
+                let g = (g_global * g_note).max(0.0).min(2.0);
+                acc += filt.process(x) * g;
+            }
+
+            // Normalize the summed band outputs.
+            acc /= n_filt;
+
+            let mut y = x * (1.0 - mix) + acc * mix;
+            // Simple limiter/soft clip to prevent hard digital clipping.
+            y = y.tanh();
+            input[i] = y.max(-1.0).min(1.0);
+        }
     }
 
     // --- Formant shift (very rough): spectral tilt using 1-pole lowpass split.
     // Positive formant_shift => brighter; negative => darker.
     let s = note.formant_shift;
-    if s.is_finite() && s.abs() > 1.0e-3 {
+    if formant_active {
         let tilt = (2.0_f32).powf(s / 12.0);
         let gain_hi = tilt.powf(0.5).max(0.5).min(2.0);
         let gain_lo = (1.0 / tilt).powf(0.5).max(0.5).min(2.0);

@@ -3,8 +3,9 @@ export interface HarmonicProfile {
 	harmonics: number[]; // harmonic 1..N linear gain (1.0 = 0dB)
 }
 
-export interface TrackMeanSpectrum {
+export interface TrackSoundProfile {
 	harmonics: number[]; // track-global harmonic gains
+	formantShift: number; // semitones (rough)
 }
 
 export type HarmonicsConfig = {
@@ -23,4 +24,13 @@ export const DEFAULT_HARMONICS_CONFIG: HarmonicsConfig = {
 
 export function createDefaultHarmonics(config: HarmonicsConfig = DEFAULT_HARMONICS_CONFIG): number[] {
 	return Array.from({ length: config.count }, () => config.defaultGain);
+}
+
+export function createDefaultTrackSoundProfile(
+	config: HarmonicsConfig = DEFAULT_HARMONICS_CONFIG
+): TrackSoundProfile {
+	return {
+		harmonics: createDefaultHarmonics(config),
+		formantShift: 0
+	};
 }

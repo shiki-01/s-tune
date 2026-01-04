@@ -19,46 +19,56 @@ function midiToHz(midi: number): number {
 	return 440 * Math.pow(2, (midi - 69) / 12);
 }
 
-export function createDummyPitchDetector(options?: DummyPitchDetectorOptions): PitchDetector {
-	const frameHopSec = options?.frameHopSec ?? 0.01;
-	const maxDurationSec = options?.maxDurationSec ?? 20;
-	const baseMidi = options?.baseMidi ?? 60; // C4
+// Requested API: class-based dummy detector (swappable later)
+export class DummyPitchDetector implements PitchDetector {
+	private frameHopSec: number;
+	private maxDurationSec: number;
+	private baseMidi: number;
 
-	return {
-		async detectPitch(audioBuffer: AudioBuffer): Promise<PitchFrame[]> {
-			const dur = Math.max(0, Math.min(audioBuffer.duration, maxDurationSec));
-			const total = Math.max(1, Math.floor(dur / frameHopSec));
+	constructor(options?: DummyPitchDetectorOptions) {
+		this.frameHopSec = options?.frameHopSec ?? 0.01;
+		this.maxDurationSec = options?.maxDurationSec ?? 20;
+		this.baseMidi = options?.baseMidi ?? 60; // C4
+	}
 
-			// 例: 0.35s voiced + 0.10s unvoiced を繰り返しつつ、スケール上を階段状に動く
-			const voicedSec = 0.35;
-			const unvoicedSec = 0.1;
-			const phraseSec = voicedSec + unvoicedSec;
+	async detectPitch(audioBuffer: AudioBuffer): Promise<PitchFrame[]> {
+		const dur = Math.max(0, Math.min(audioBuffer.duration, this.maxDurationSec));
+		const total = Math.max(1, Math.floor(dur / this.frameHopSec));
 
-			const scaleSteps = [0, 2, 4, 5, 7, 9, 11] as const; // major
-			const frames: PitchFrame[] = [];
+		// 例: 0.35s voiced + 0.10s unvoiced を繰り返しつつ、スケール上を階段状に動く
+		const voicedSec = 0.35;
+		const unvoicedSec = 0.1;
+		const phraseSec = voicedSec + unvoicedSec;
 
-			for (let i = 0; i < total; i++) {
-				const t = i * frameHopSec;
-				const phase = t % phraseSec;
+		const scaleSteps = [0, 2, 4, 5, 7, 9, 11] as const; // major
+		const frames: PitchFrame[] = [];
 
-				if (phase >= voicedSec) {
-					frames.push({ time: t, f0: null, confidence: 0 });
-					continue;
-				}
+		for (let i = 0; i < total; i++) {
+			const t = i * this.frameHopSec;
+			const phase = t % phraseSec;
 
-				const stepIdx = Math.floor(t / phraseSec) % scaleSteps.length;
-				const midi = baseMidi + scaleSteps[stepIdx];
-				const f0 = midiToHz(midi);
-
-				// 少しだけ揺らぎ (ダミー感を減らす)
-				const vibrato = Math.sin(2 * Math.PI * 5 * t) * 0.15; // semitone-ish small
-				const f0V = f0 * Math.pow(2, vibrato / 12);
-
-				const conf = clamp01(0.85 - 0.1 * Math.abs(Math.sin(2 * Math.PI * t * 0.7)));
-				frames.push({ time: t, f0: f0V, confidence: conf });
+			if (phase >= voicedSec) {
+				frames.push({ time: t, f0: null, confidence: 0 });
+				continue;
 			}
 
-			return frames;
+			const stepIdx = Math.floor(t / phraseSec) % scaleSteps.length;
+			const midi = this.baseMidi + scaleSteps[stepIdx];
+			const f0 = midiToHz(midi);
+
+			// 少しだけ揺らぎ (ダミー感を減らす)
+			const vibrato = Math.sin(2 * Math.PI * 5 * t) * 0.15; // semitone-ish small
+			const f0V = f0 * Math.pow(2, vibrato / 12);
+
+			const conf = clamp01(0.85 - 0.1 * Math.abs(Math.sin(2 * Math.PI * t * 0.7)));
+			frames.push({ time: t, f0: f0V, confidence: conf });
 		}
-	};
+
+		return frames;
+	}
+}
+
+// Backward-compatible factory
+export function createDummyPitchDetector(options?: DummyPitchDetectorOptions): PitchDetector {
+	return new DummyPitchDetector(options);
 }

@@ -137,10 +137,20 @@ export function detectNotesFromPitch(
 	return notes;
 }
 
+// New public API (requested): KeyScale
+export interface KeyScale {
+	rootMidi: number; // e.g. C4 = 60
+	steps: number[]; // degrees within octave (0..11)
+	name: string; // e.g. "C Major"
+}
+
+// Backward-compatible internal alias used by older code paths.
 export type Key = {
 	rootMidi: number; // pitch-class is derived from this
 	scaleSteps: readonly number[]; // degrees within octave (0..11)
 };
+
+type ScaleLike = KeyScale | Key;
 
 export const SCALES = {
 	major: [0, 2, 4, 5, 7, 9, 11],
@@ -149,17 +159,25 @@ export const SCALES = {
 
 export type ScaleName = keyof typeof SCALES;
 
-export function makeKey(rootPitchClass: number, scale: ScaleName, rootOctaveMidi = 60): Key {
+export function makeKey(rootPitchClass: number, scale: ScaleName, rootOctaveMidi = 60): KeyScale {
 	const pc = ((rootPitchClass % 12) + 12) % 12;
+	const rootMidi = rootOctaveMidi + pc;
+	const rootName = midiPitchClassName(pc);
+	const scaleLabel = scale === 'major' ? 'Major' : scale === 'minor' ? 'Minor' : String(scale);
 	return {
-		rootMidi: rootOctaveMidi + pc,
-		scaleSteps: SCALES[scale]
+		rootMidi,
+		steps: [...SCALES[scale]],
+		name: `${rootName} ${scaleLabel}`
 	};
 }
 
-function inScale(midi: number, key: Key): boolean {
+function stepsOf(key: ScaleLike): readonly number[] {
+	return 'steps' in key ? key.steps : key.scaleSteps;
+}
+
+function inScale(midi: number, key: ScaleLike): boolean {
 	const pc = ((midi - key.rootMidi) % 12 + 12) % 12;
-	return key.scaleSteps.includes(pc);
+	return stepsOf(key).includes(pc);
 }
 
 export function midiPitchClassName(pc: number): string {
@@ -168,7 +186,7 @@ export function midiPitchClassName(pc: number): string {
 	return names[idx] ?? 'C';
 }
 
-export function snapMidiToScale(midi: number, key: Key): number {
+export function snapMidiToScale(midi: number, key: ScaleLike): number {
 	if (!Number.isFinite(midi)) return midi;
 	const m = Math.round(midi);
 	if (inScale(m, key)) return m;
@@ -193,7 +211,7 @@ export function snapMidiToScale(midi: number, key: Key): number {
 	return bestDist === Number.POSITIVE_INFINITY ? m : best;
 }
 
-export function detectedNotesToNoteSegments(detected: DetectedNote[], key?: Key): NoteSegment[] {
+export function detectedNotesToNoteSegments(detected: DetectedNote[], key?: ScaleLike): NoteSegment[] {
 	return detected
 		.filter((n) => n.endTime > n.startTime)
 		.map((n) => {
@@ -202,13 +220,14 @@ export function detectedNotesToNoteSegments(detected: DetectedNote[], key?: Key)
 				id: n.id,
 				startTime: n.startTime,
 				endTime: n.endTime,
-				baseSemitone: n.midi,
-				pitchOffset: 0,
+				sourceStartTime: n.startTime,
+				sourceEndTime: n.endTime,
+				sourceSemitone: n.midi,
+				// 初期値: スナップ先を「ターゲットの基準音高」にする
+				baseSemitone: snapped,
 				pitchCenterOffset: 0,
-				pitchModAmount: 1,
-				pitchDriftAmount: 1,
-				timeStretchStart: 1,
-				timeStretchEnd: 1,
+				pitchDrift: 0,
+				vibratoDepth: 0,
 				formantShift: 0,
 				enabled: true,
 				snappedSemitone: snapped
